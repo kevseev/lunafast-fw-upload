@@ -86,6 +86,23 @@ docker compose run --rm tablet-deploy --no-ui --model Samsung /apks/app.apk
 | `docker-compose.yml` | Запуск с `./apks` и host-сетью |
 | `apks/`          | Каталог для APK (не коммитятся бинарники) |
 
+## Публикация и релиз на GitHub
+
+После авторизации (`gh auth login` или SSH‑ключ, добавленный в аккаунт GitHub):
+
+```bash
+git push -u origin main
+git push origin v1.0.0
+```
+
+Создать релиз с заметками (нужен [GitHub CLI](https://cli.github.com/)):
+
+```bash
+gh release create v1.0.0 --title "v1.0.0" --notes "Первый релиз: tablet_deploy, Docker Compose, README."
+```
+
+Либо на сайте: **Releases → Draft a new release →** выберите тег `v1.0.0`.
+
 ## Лицензия
 
 По усмотрению владельца репозитория; при необходимости добавьте файл `LICENSE`.
