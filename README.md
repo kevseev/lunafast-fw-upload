@@ -1,120 +1,61 @@
 # lunafast-fw-upload
 
-Консольный инструмент для **подключения к Android‑планшетам по сетевому ADB**, **просмотра модели/производителя** и **массовой установки APK**. Интерфейс в терминале оформлен через [Rich](https://github.com/Textualize/rich) (псевдографика: рамки, таблицы).
+Консольный инструмент для **подключения к Android‑планшетам по сетевому ADB**, **просмотра модели/производителя** и **установки APK**. В терминале используется [Rich](https://github.com/Textualize/rich) (рамки и таблицы).
 
-По умолчанию ожидаются два устройства в LAN:
+По умолчанию в пакетном режиме ожидаются два устройства в LAN:
 
 | Хост            | Порт ADB |
 |-----------------|----------|
 | `192.168.1.211` | `5555`   |
 | `192.168.1.213` | `5555`   |
 
-Список хостов можно переопределить флагом `--host` (см. ниже).
+Список хостов задаётся флагом `--host` или пунктом меню «Поиск».
+
+## Интерактивное меню
+
+В **интерактивном терминале** при запуске без аргументов (или с **`--menu`** / **`-m`**) открывается меню:
+
+1. **Поиск в сети** — скан подсети из настроек (хосты «prefix».1–254), открытый TCP-порт ADB, затем `adb connect`.
+2. **Загрузка APK** — установка файла на все устройства в состоянии `device`.
+3. **Настройки** — порт ADB и подсеть поиска (`~/.lunafast_fw_upload/settings.json` или **`LUNAFAST_CONFIG`**).
+
+Пакетный режим: укажите путь к APK, `--host`, `--model` или **`--no-ui`**.
 
 ## Требования
 
-- **Android Platform Tools** (`adb` в `PATH`) — при запуске **не** из Docker.
-- На планшетах: включена **отладка по сети** / **Wireless debugging**, порт **5555** (или свой порт — укажите в `IP:PORT`).
-- Сеть: машина с инструментом должна доходить до IP планшетов.
+- **Python 3.10+**, зависимости из `requirements.txt`.
+- **Android Platform Tools** (`adb` в `PATH`).
+- На планшетах: сетевой ADB (часто порт `5555`).
 
-## Быстрый старт (Python)
+## Установка и запуск
 
 ```bash
 pip install -r requirements.txt
-python3 tablet_deploy.py
+python3 tablet_deploy.py              # меню
+python3 tablet_deploy.py --menu      # явно меню
+python3 tablet_deploy.py /path/app.apk
+python3 tablet_deploy.py --no-ui /path/app.apk
+python3 tablet_deploy.py --host 192.168.1.100:5555
 ```
 
-Установка APK на все подключённые после `adb connect` устройства:
-
-```bash
-python3 tablet_deploy.py /path/to/app.apk
-```
-
-Только устройства, у которых производитель + модель содержат подстроку:
-
-```bash
-python3 tablet_deploy.py --model TabA /path/to/app.apk
-```
-
-Свои хосты:
-
-```bash
-python3 tablet_deploy.py --host 192.168.1.100:5555 --host 192.168.1.101:5559
-```
-
-Плоский вывод без большого макета:
-
-```bash
-python3 tablet_deploy.py --no-ui /path/to/app.apk
-```
-
-## Docker и Compose
-
-Сборка и запуск из каталога репозитория:
-
-```bash
-docker compose build
-```
-
-Интерактивный экран (нужен TTY):
-
-```bash
-docker compose run --rm tablet-deploy
-```
-
-APK удобно класть в `./apks/` на хосте — каталог смонтирован в контейнер как `/apks` (только чтение):
-
-```bash
-docker compose run --rm tablet-deploy /apks/my-application.apk
-```
-
-На **Linux** в `docker-compose.yml` используется `network_mode: host`, чтобы контейнер видел планшеты в локальной сети так же, как хост.
-
-Дополнительные аргументы скрипта передаются после имени сервиса:
-
-```bash
-docker compose run --rm tablet-deploy --no-ui --model Samsung /apks/app.apk
-```
-
-## Релизы: готовый образ без сборки
-
-На странице **[Releases](https://github.com/kevseev/lunafast-fw-upload/releases)** выкладываются:
-
-- **`lunafast-tablet-deploy-vVERSION.tar.gz`** — полный образ (`docker load`);
-- **`MANUAL.md`** — пошаговая установка и запуск;
-- **`docker-compose.yml`** — из каталога `release/` в репозитории (тот же файл прикладывается к релизу для скачивания одним архивом распространения).
-
-Подробности — в **`MANUAL.md`**.
+Каталог **`apks/`** можно использовать для APK: в меню п.2 допускается имя файла из `apks/`.
 
 ## Структура репозитория
 
-| Файл / каталог   | Назначение                          |
-|------------------|-------------------------------------|
-| `tablet_deploy.py` | Основной скрипт                   |
-| `requirements.txt` | Зависимости Python                |
-| `Dockerfile`     | Образ с Python, `adb`, зависимостями |
-| `docker-compose.yml` | Запуск с `./apks` и host-сетью |
-| `release/docker-compose.yml` | Только `image:` — для использования с архивом из релиза |
-| `MANUAL.md`      | Ручное руководство для установки из релиза |
-| `apks/`          | Каталог для APK (не коммитятся бинарники) |
+| Файл | Назначение |
+|------|------------|
+| `tablet_deploy.py` | Скрипт |
+| `requirements.txt` | Зависимости Python |
+| `MANUAL.md` | Краткая памятка по запуску |
+| `apks/` | Локальные APK (в git не коммитятся) |
 
-## Публикация и релиз на GitHub
-
-После авторизации (`gh auth login` или SSH‑ключ, добавленный в аккаунт GitHub):
+## Публикация на GitHub
 
 ```bash
 git push -u origin main
-git push origin v1.0.0
+git push origin v1.x.x
 ```
-
-Создать релиз с заметками (нужен [GitHub CLI](https://cli.github.com/)):
-
-```bash
-gh release create v1.0.0 --title "v1.0.0" --notes "Первый релиз: tablet_deploy, Docker Compose, README."
-```
-
-Либо на сайте: **Releases → Draft a new release →** выберите тег `v1.0.0`.
 
 ## Лицензия
 
-По усмотрению владельца репозитория; при необходимости добавьте файл `LICENSE`.
+По усмотрению владельца репозитория; при необходимости добавьте `LICENSE`.
