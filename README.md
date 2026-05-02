@@ -13,14 +13,16 @@
 
 ```bash
 chmod +x tablet_deploy.sh   # один раз
-./tablet_deploy.sh          # меню (нужен интерактивный терминал)
+./tablet_deploy.sh          # меню
 ./tablet_deploy.sh --menu
-./tablet_deploy.sh --no-ui  # connect к .211 и .213, затем adb devices -l
-./tablet_deploy.sh /путь/app.apk  # установка на все «device»
+./tablet_deploy.sh --no-ui  # connect к .211 и .213 (порт из настроек), список устройств
+./tablet_deploy.sh --connect 192.168.1.211:5555 --no-ui   # только указанные хосты
+./tablet_deploy.sh --connect 192.168.1.211:5555 --connect 192.168.1.213:5555 app.apk
+./tablet_deploy.sh /путь/app.apk
 ./tablet_deploy.sh --help
 ```
 
-В меню: **1** — поиск в сети, **2** — установка APK (можно имя файла из `./apks/`), **3** — порт ADB и подсеть (например `192.168.1`).
+В меню: **1** — поиск в сети, **2** — установка APK (в начале можно ввести **IP:PORT** для `adb connect`), **3** — порт ADB и подсеть.
 
 ## Настройки
 

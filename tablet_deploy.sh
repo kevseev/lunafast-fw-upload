@@ -48,12 +48,17 @@ save_settings() {
 usage() {
 	printf '%s\n' "Использование: tablet_deploy.sh [опции] [файл.apk]
   (без аргументов, TTY) — интерактивное меню
-  -m, --menu          — только меню
-  --no-ui             — adb connect к ${DEFAULT_HOST1} и ${DEFAULT_HOST2}, список устройств
-  путь к .apk         — установка на все device
-  -h, --help          — эта справка
+  -m, --menu              — только меню
+  --no-ui                 — adb connect, затем adb devices -l
+  --connect IP:PORT       — явный adb connect (можно несколько раз); с --no-ui
+                            вместо хостов по умолчанию; с .apk — подключить,
+                            затем установить
+  путь к .apk             — установка на все device (после --connect, если есть)
+  -h, --help              — эта справка
 
-Настройки: см. файл из LUNAFAST_CONFIG или ~/.lunafast_fw_upload/settings"
+По умолчанию при --no-ui: connect к ${DEFAULT_HOST1} и ${DEFAULT_HOST2}.
+
+Настройки: LUNAFAST_CONFIG или ~/.lunafast_fw_upload/settings"
 }
 
 ensure_adb() {
@@ -84,11 +89,37 @@ connect_pair() {
 	printf '\n'
 }
 
+# Проверка «что-то:порт» (IPv4:port или имя:port)
+is_adb_target() {
+	case "$1" in
+	*:*:*) return 0 ;; # возможно IPv6 — пусть adb сам разберётся
+	*:*)
+		hostpart=${1%%:*}
+		portpart=${1#*:}
+		[ -n "$hostpart" ] && [ -n "$portpart" ] || return 1
+		return 0
+		;;
+	*) return 1 ;;
+	esac
+}
+
+connect_explicit_list() {
+	for a in $CONNECT_LIST; do
+		printf '%s\n' "→ adb connect $a"
+		adb connect "$a" || printf '%s\n' "   ошибка" >&2
+	done
+}
+
 quick_batch() {
 	load_settings
 	ensure_adb
-	printf '%s\n' "--- Подключение (порт $ADB_PORT) ---"
-	connect_pair "$ADB_PORT"
+	if [ -n "$CONNECT_LIST" ]; then
+		printf '%s\n' "--- Подключение (--connect) ---"
+		connect_explicit_list
+	else
+		printf '%s\n' "--- Подключение (порт $ADB_PORT, хосты по умолчанию) ---"
+		connect_pair "$ADB_PORT"
+	fi
 	printf '%s\n' "--- adb devices -l ---"
 	adb devices -l
 }
@@ -187,9 +218,22 @@ menu_search() {
 menu_install() {
 	load_settings
 	ensure_adb
+	printf '%s\n' "--- Установка APK ---"
+	printf '%s' "ADB IP:PORT для подключения [Enter если уже подключено]: "
+	read -r addr_line
+	if [ -n "$addr_line" ]; then
+		if is_adb_target "$addr_line"; then
+			printf '%s\n' "→ adb connect $addr_line"
+			adb connect "$addr_line" || printf '%s\n' "предупреждение: connect не удался" >&2
+		else
+			printf '%s\n' "Нужен формат IP:PORT (например 192.168.1.211:5555)" >&2
+			read -r _
+			return 1
+		fi
+	fi
 	list=$(adb_device_serials)
 	if [ -z "$list" ]; then
-		printf '%s\n' "Нет устройств «device». Сначала п.1 (поиск)."
+		printf '%s\n' "Нет устройств «device». Укажите IP:PORT выше или п.1 (поиск)."
 		read -r _
 		return
 	fi
@@ -225,6 +269,11 @@ menu_install() {
 }
 
 main_menu() {
+	ensure_adb
+	if [ -n "$CONNECT_LIST" ]; then
+		printf '%s\n' "--- Старт: adb connect (--connect) ---"
+		connect_explicit_list
+	fi
 	while :; do
 		load_settings
 		clear 2>/dev/null || printf '\n\n'
@@ -233,7 +282,7 @@ main_menu() {
 		printf '%s\n' "  Порт $ADB_PORT   Подсеть ${SCAN_SUBNET}.x"
 		printf '%s\n' "=============================================="
 		printf '%s\n' "  1) Поиск устройств в сети"
-		printf '%s\n' "  2) Установка APK"
+		printf '%s\n' "  2) Установка APK (прямой adb IP:PORT или уже подключённые)"
 		printf '%s\n' "  3) Настройки (порт ADB, подсеть)"
 		printf '%s\n' "  0) Выход"
 		printf '%s\n' "=============================================="
@@ -257,6 +306,10 @@ install_apk_batch() {
 	fi
 	load_settings
 	ensure_adb
+	if [ -n "$CONNECT_LIST" ]; then
+		printf '%s\n' "--- adb connect (--connect) ---"
+		connect_explicit_list
+	fi
 	list=$(adb_device_serials)
 	if [ -z "$list" ]; then
 		printf '%s\n' "Нет устройств." >&2
@@ -273,9 +326,23 @@ install_apk_batch() {
 MENU=
 NO_UI=
 APK=
+CONNECT_LIST=
 
 while [ $# -gt 0 ]; do
 	case "$1" in
+	--connect)
+		shift
+		if [ -z "$1" ]; then
+			printf '%s\n' "Ожидается IP:PORT после --connect" >&2
+			exit 1
+		fi
+		if ! is_adb_target "$1"; then
+			printf '%s\n' "Неверный адрес (нужно IP:PORT или host:PORT): $1" >&2
+			exit 1
+		fi
+		CONNECT_LIST="$CONNECT_LIST${CONNECT_LIST:+ }$1"
+		shift
+		;;
 	-m | --menu)
 		MENU=1
 		shift

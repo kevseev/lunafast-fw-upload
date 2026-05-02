@@ -17,6 +17,8 @@
 
 ```bash
 ./tablet_deploy.sh --no-ui
+./tablet_deploy.sh --connect 192.168.1.50:5555 --no-ui
+./tablet_deploy.sh --connect 192.168.1.211:5555 /полный/путь/app.apk
 ./tablet_deploy.sh /полный/путь/app.apk
 ```
 
