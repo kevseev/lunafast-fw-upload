@@ -1,0 +1,13 @@
+services:
+  tablet-deploy:
+    build: .
+    image: lunafast-tablet-deploy:latest
+    init: true
+    stdin_open: true
+    tty: true
+    # Доступ к планшетам в LAN (192.168.x.x) без NAT-ограничений моста
+    network_mode: host
+    volumes:
+      - ./apks:/apks:ro
+    # Пример: docker compose run --rm tablet-deploy /apks/app.apk
+    command: []

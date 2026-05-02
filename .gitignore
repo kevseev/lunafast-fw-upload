@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.env
+.venv/
+venv/
+
+# APK и артефакты в точке монтирования
+apks/*
+!apks/.gitkeep
