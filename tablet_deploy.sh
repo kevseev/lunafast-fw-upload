@@ -97,6 +97,16 @@ print_numbered_serials() {
 	done <"$sf"
 }
 
+# Заметный заголовок шага выбора целей
+banner_pick_devices() {
+	printf '%s\n' ""
+	printf '%s\n' "  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+	printf '%s\n' "  >>>  ВЫБОР УСТРОЙСТВ ДЛЯ ПРОШИВКИ (по номерам)  <<<"
+	printf '%s\n' "  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
+	printf '%s\n' "  Ниже — нумерованный список (только «device»):"
+	printf '%s\n' ""
+}
+
 # choice: пусто / all / * / все → все строки из sf; иначе номера через пробел или запятую
 # Результат в outf (по одному serial на строку, уникальные)
 pick_serials_to_file() {
@@ -282,7 +292,7 @@ menu_search() {
 			printf '%s\n' "--- Устройства (adb devices -l) ---"
 			adb devices -l
 			printf '%s\n' "----------------------------------------------"
-			printf '%s\n' "  1) Установить APK (выбор устройств)"
+			printf '%s\n' "  1) Установить APK (выбор номеров устройств — см. шаг 2 в мастере)"
 			printf '%s\n' "  2) Повторить поиск в этой подсети"
 			printf '%s\n' "  0) Главное меню"
 			printf '%s\n' "----------------------------------------------"
@@ -315,9 +325,11 @@ menu_install() {
 	fi
 	load_settings
 	ensure_adb
-	printf '%s\n' "--- Установка APK ---"
+	printf '%s\n' "=================================================="
+	printf '%s\n' "  УСТАНОВКА APK — сначала файл, потом КТО из списка"
+	printf '%s\n' "=================================================="
 	if [ -z "$skipc" ]; then
-		printf '%s' "ADB IP:PORT для подключения [Enter если уже подключено]: "
+		printf '%s' "Шаг 0. ADB IP:PORT [Enter если уже подключено]: "
 		read -r addr_line
 		if [ -n "$addr_line" ]; then
 			if is_adb_target "$addr_line"; then
@@ -342,17 +354,8 @@ menu_install() {
 		read -r _
 		return
 	fi
-	printf '%s\n' "Устройства (номер — для выбора):"
-	print_numbered_serials "$sf"
-	printf '%s\n' "---"
-	printf '%s' "На какие ставим APK? [Enter = все | пример: 1 или 1 3 или 1,2]: "
-	read -r pick_in
-	if ! pick_serials_to_file "$sf" "$pick_in" "$picked"; then
-		rm -f "$sf" "$picked"
-		read -r _
-		return 1
-	fi
-	printf '%s' "Путь к APK или имя из ./apks: "
+	printf '%s\n' ""
+	printf '%s' "Шаг 1. Путь к APK или имя из ./apks: "
 	read -r path_in
 	if [ -z "$path_in" ]; then
 		rm -f "$sf" "$picked"
@@ -369,8 +372,23 @@ menu_install() {
 		read -r _
 		return
 	fi
+	banner_pick_devices
+	print_numbered_serials "$sf"
+	printf '%s\n' "  --------------------------------------------------"
+	printf '%s\n' "  Шаг 2. КУДА ставим $(basename "$apk")?"
+	printf '%s\n' "    Enter или «все» = на ВСЕ перечисленные"
+	printf '%s\n' "    Или номера: одно (1) или несколько через пробел/запятую (1 3  или  1,2)"
+	printf '%s\n' "  --------------------------------------------------"
+	printf '%s' "  Ваш выбор номеров: "
+	read -r pick_in
+	if ! pick_serials_to_file "$sf" "$pick_in" "$picked"; then
+		rm -f "$sf" "$picked"
+		read -r _
+		return 1
+	fi
 	tlist=$(tr '\n' ' ' <"$picked")
-	printf '%s' "Установить $(basename "$apk") на: $tlist ? [y/N]: "
+	printf '%s\n' ""
+	printf '%s' "Подтвердить: $(basename "$apk") → устройства: $tlist ? [y/N]: "
 	read -r y
 	case "$y" in
 	y | Y | yes | YES | д | Д | да | Да) ;;
@@ -386,6 +404,7 @@ menu_install() {
 		adb -s "$serial" install -r "$apk" || printf '%s\n' "  ошибка" >&2
 	done <"$picked"
 	rm -f "$sf" "$picked"
+	printf '%s\n' "Готово. Enter..."
 	read -r _
 }
 
@@ -405,7 +424,7 @@ main_menu() {
 		printf '%s\n' "  Порт $ADB_PORT   Подсеть ${SCAN_SUBNET}.x"
 		printf '%s\n' "=============================================="
 		printf '%s\n' "  1) Поиск устройств в сети"
-		printf '%s\n' "  2) Установка APK (прямой adb IP:PORT или уже подключённые)"
+		printf '%s\n' "  2) Установка APK — выбор устройств по номерам, затем файл"
 		printf '%s\n' "  3) Настройки (порт ADB, подсеть)"
 		printf '%s\n' "  0) Выход"
 		printf '%s\n' "=============================================="
