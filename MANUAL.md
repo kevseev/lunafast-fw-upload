@@ -2,30 +2,35 @@
 
 ## Установка
 
-1. Установите [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools) и убедитесь, что **`adb`** доступен в терминале.
-2. В каталоге проекта:
+1. Установите **adb** (Android Platform Tools).
+2. Сделайте скрипт исполняемым: `chmod +x tablet_deploy.sh`
+
+## Меню
 
 ```bash
-pip install -r requirements.txt
+./tablet_deploy.sh
 ```
 
-## Запуск
+Пункты: поиск по LAN, установка APK, настройки порта и подсети.
 
-Интерактивное меню (поиск, установка APK, настройка порта и подсети):
+## Без меню
 
 ```bash
-python3 tablet_deploy.py
+./tablet_deploy.sh --no-ui
+./tablet_deploy.sh /полный/путь/app.apk
 ```
 
-Пакетно, без меню:
+## Настройки
 
-```bash
-python3 tablet_deploy.py --no-ui
-python3 tablet_deploy.py --no-ui /полный/путь/к/файлу.apk
+Файл по умолчанию: **`~/.lunafast_fw_upload/settings`**
+
+Либо переменная **`LUNAFAST_CONFIG`**: путь к файлу настроек или к каталогу (тогда используется `<каталог>/settings`).
+
+Формат файла — обычные присваивания для shell:
+
+```
+ADB_PORT=5555
+SCAN_SUBNET=192.168.1
 ```
 
-Настройки меню сохраняются в **`~/.lunafast_fw_upload/settings.json`**. Путь к файлу настроек можно задать переменной **`LUNAFAST_CONFIG`** (полный путь к JSON-файлу).
-
-## Сеть
-
-Планшеты должны быть доступны по IP с вашей машины; на устройстве должен быть включён **отладка по Wi‑Fi** / **Wireless debugging** на том же порту, что в настройках (по умолчанию **5555**).
+*(Ранее использовавшийся JSON из версии на Python сюда не подходит — перенастройте порт и подсеть вручную один раз.)*
