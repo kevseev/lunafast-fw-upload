@@ -1,39 +1,36 @@
 # lunafast-fw-upload
 
-Консольное **shell**-приложение (`/bin/sh`): **поиск** устройств с сетевым ADB в LAN, **установка APK**, **настройка порта** и подсети сканирования.
+Консольный **shell**-скрипт: поиск ADB в LAN, **выбор устройств** для прошивки, установка APK, настройки.
 
-По умолчанию для быстрого `adb connect` (режим `--no-ui`): **192.168.1.211** и **192.168.1.213**, порт из настроек (**5555**).
+## Интерфейс
 
-## Требования
+1. **С пакетом `dialog`** (рекомендуется): псевдографика **ncurses** — стрелки, **вложенные меню**, **checklist** (Пробел отмечает устройства), заголовки с иерархией `Главная › Прошивка › …`.
 
-- [Android Platform Tools](https://developer.android.com/tools/releases/platform-tools) — команда **`adb`** в `PATH`.
-- Для быстрого пункта «Поиск» желателен **`nc`** (netcat); без него используется перебор `adb connect` по всей подсети (дольше).
+```bash
+sudo apt install dialog   # Debian/Ubuntu
+./tablet_deploy.sh
+```
+
+2. **Без `dialog`**: текстовые рамки Unicode и те же пункты по номерам (подсказка при запуске).
+
+## Иерархия меню (dialog)
+
+- **Главное меню** → Сеть / **Прошивка** / Настройки / просмотр `adb devices`.
+- **Прошивка** (вложенное):
+  - **п.2** — отдельный пункт **«Выбор устройств для прошивки»** (checklist → сохраняется в `~/.lunafast_fw_upload/selected_targets`);
+  - **п.3** — установить APK **только на сохранённый список**;
+  - **п.4** — мастер: connect → APK → checklist → установка.
 
 ## Запуск
 
 ```bash
-chmod +x tablet_deploy.sh   # один раз
-./tablet_deploy.sh          # меню
-./tablet_deploy.sh --menu
-./tablet_deploy.sh --no-ui  # connect к .211 и .213 (порт из настроек), список устройств
-./tablet_deploy.sh --connect 192.168.1.211:5555 --no-ui   # только указанные хосты
-./tablet_deploy.sh --connect 192.168.1.211:5555 --connect 192.168.1.213:5555 app.apk
-./tablet_deploy.sh /путь/app.apk
-./tablet_deploy.sh --help
+chmod +x tablet_deploy.sh
+./tablet_deploy.sh
+./tablet_deploy.sh --no-ui
+./tablet_deploy.sh --connect IP:5555 app.apk
 ```
 
-В меню: при каждом показе главного экрана — **`adb devices -l`**. **1** — поиск (потом подменю). **2** — прошивка: **сначала путь к APK**, затем **явный блок «ВЫБОР УСТРОЙСТВ ПО НОМЕРАМ»** (Enter = все). **3** — настройки.
-
-## Настройки
-
-Файл **`~/.lunafast_fw_upload/settings`** (формат `KEY=value`):
-
-```
-ADB_PORT=5555
-SCAN_SUBNET=192.168.1
-```
-
-Или каталог/файл через **`LUNAFAST_CONFIG`** (как каталог — создаётся `settings` внутри).
+Настройки: `~/.lunafast_fw_upload/settings` (`ADB_PORT`, `SCAN_SUBNET`), переменная **`LUNAFAST_CONFIG`**.
 
 ## Структура
 
@@ -41,7 +38,7 @@ SCAN_SUBNET=192.168.1
 |------|------------|
 | `tablet_deploy.sh` | Скрипт |
 | `MANUAL.md` | Краткая памятка |
-| `apks/` | APK для п.2 меню (в git не коммитятся) |
+| `apks/` | APK (не в git) |
 
 ## Лицензия
 

@@ -1,13 +1,13 @@
 #!/bin/sh
-# lunafast-fw-upload — консоль: поиск ADB в LAN, установка APK, настройка порта.
-# Зависимости: adb в PATH; для п.1 желателен nc (netcat), иначе медленнее через adb connect.
+# lunafast-fw-upload — поиск ADB в LAN, прошивка APK, настройки.
+# Интерфейс: при наличии пакета «dialog» — псевдографика, стрелки, вложенные меню.
+# Иначе — текстовый режим с рамками (ASCII). Нужны: adb; для поиска желателен nc.
 
 set_defaults() {
 	ADB_PORT=5555
 	SCAN_SUBNET=192.168.1
 }
 
-# Адреса для быстрого подключения (--no-ui или не-TTY без аргументов)
 DEFAULT_HOST1=192.168.1.211
 DEFAULT_HOST2=192.168.1.213
 
@@ -21,6 +21,14 @@ settings_file() {
 	else
 		printf '%s/.lunafast_fw_upload/settings\n' "${HOME:-$PWD}"
 	fi
+}
+
+state_dir() {
+	dirname "$(settings_file)"
+}
+
+selected_targets_file() {
+	printf '%s/selected_targets\n' "$(state_dir)"
 }
 
 load_settings() {
@@ -42,73 +50,76 @@ save_settings() {
 		printf 'ADB_PORT=%s\n' "$ADB_PORT"
 		printf 'SCAN_SUBNET=%s\n' "$SCAN_SUBNET"
 	} >"$SETTINGS_FILE" || exit
-	printf 'Сохранено: %s\n' "$SETTINGS_FILE"
 }
 
 usage() {
 	printf '%s\n' "Использование: tablet_deploy.sh [опции] [файл.apk]
-  (без аргументов, TTY) — интерактивное меню
-  -m, --menu              — только меню
-  --no-ui                 — adb connect, затем adb devices -l
-  --connect IP:PORT       — явный adb connect (можно несколько раз); с --no-ui
-                            вместо хостов по умолчанию; с .apk — подключить,
-                            затем установить
-  путь к .apk             — установка на все device (после --connect, если есть)
-  -h, --help              — эта справка
+  Интерфейс: dialog (меню со стрелками), если установлен пакет «dialog».
+  -m, --menu      меню
+  --no-ui         быстрый adb connect + devices
+  --connect H:P   (повторимо) явный connect; с .apk — ставит на все device
+  -h, --help
 
-По умолчанию при --no-ui: connect к ${DEFAULT_HOST1} и ${DEFAULT_HOST2}.
-
-Настройки: LUNAFAST_CONFIG или ~/.lunafast_fw_upload/settings"
+UI без dialog: текстовые рамки. Установка: apt install dialog (Debian/Ubuntu)."
 }
 
 ensure_adb() {
-	if ! command -v adb >/dev/null 2>&1; then
-		printf '%s\n' "Ошибка: команда adb не найдена. Установите Android Platform Tools." >&2
+	command -v adb >/dev/null 2>&1 || {
+		printf '%s\n' "Нет adb в PATH." >&2
 		exit 1
-	fi
+	}
+}
+
+have_dialog() {
+	command -v dialog >/dev/null 2>&1
 }
 
 probe_tcp() {
-	if command -v nc >/dev/null 2>&1; then
-		nc -z -w1 "$1" "$2" >/dev/null 2>&1
-	else
-		return 1
-	fi
+	command -v nc >/dev/null 2>&1 && nc -z -w1 "$1" "$2" >/dev/null 2>&1
 }
 
 adb_device_serials() {
 	adb devices 2>/dev/null | awk 'NR>1 && $2=="device" { print $1 }'
 }
 
-# Записать список serial в файл (по одному в строке)
 refresh_serials_file() {
-	sf=$1
-	adb_device_serials >"$sf"
+	adb_device_serials >"$1"
 }
 
-# Пронумерованный список из файла
-print_numbered_serials() {
-	sf=$1
-	i=1
-	while read -r line; do
-		[ -z "$line" ] && continue
-		printf '  %s) %s\n' "$i" "$line"
-		i=$((i + 1))
-	done <"$sf"
+is_adb_target() {
+	case "$1" in
+	*:*:*) return 0 ;;
+	*:*)
+		h=${1%%:*}
+		p=${1#*:}
+		[ -n "$h" ] && [ -n "$p" ] || return 1
+		return 0
+		;;
+	*) return 1 ;;
+	esac
 }
 
-# Заметный заголовок шага выбора целей
-banner_pick_devices() {
-	printf '%s\n' ""
-	printf '%s\n' "  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-	printf '%s\n' "  >>>  ВЫБОР УСТРОЙСТВ ДЛЯ ПРОШИВКИ (по номерам)  <<<"
-	printf '%s\n' "  >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-	printf '%s\n' "  Ниже — нумерованный список (только «device»):"
-	printf '%s\n' ""
+connect_pair() {
+	p="$1"
+	adb connect "${DEFAULT_HOST1}:${p}" 2>/dev/null
+	adb connect "${DEFAULT_HOST2}:${p}" 2>/dev/null
 }
 
-# choice: пусто / all / * / все → все строки из sf; иначе номера через пробел или запятую
-# Результат в outf (по одному serial на строку, уникальные)
+connect_explicit_list() {
+	for a in $CONNECT_LIST; do adb connect "$a" || true; done
+}
+
+quick_batch() {
+	load_settings
+	ensure_adb
+	if [ -n "$CONNECT_LIST" ]; then
+		connect_explicit_list
+	else
+		connect_pair "$ADB_PORT"
+	fi
+	adb devices -l
+}
+
 pick_serials_to_file() {
 	sf=$1
 	choice=$2
@@ -116,355 +127,545 @@ pick_serials_to_file() {
 	n=$(wc -l <"$sf" | tr -d ' ')
 	: >"$outf"
 	[ "${n:-0}" -eq 0 ] && return 1
-
-	set_all=0
+	a=0
 	ch=$(printf '%s' "$choice" | tr -d ' \t')
-	[ -z "$ch" ] && set_all=1
-	[ "$ch" = '*' ] && set_all=1
-	case "$choice" in
-	all | ALL | все | Все) set_all=1 ;;
-	esac
-
-	if [ "$set_all" -eq 1 ]; then
+	[ -z "$ch" ] && a=1
+	[ "$ch" = '*' ] && a=1
+	case "$choice" in all | ALL | все | Все) a=1 ;; esac
+	if [ "$a" -eq 1 ]; then
 		cp "$sf" "$outf"
 		return 0
 	fi
-
-	tmp=$(mktemp) || return 1
-	nums=$(printf '%s' "$choice" | tr ',' ' ')
-	for idx in $nums; do
+	t=$(mktemp) || return 1
+	for idx in $(printf '%s' "$choice" | tr ',' ' '); do
 		[ -z "$idx" ] && continue
-		case "$idx" in
-		*[!0-9]*)
-			printf '%s\n' "Неверный номер: $idx (ожидаются 1–$n)" >&2
-			rm -f "$tmp"
+		case "$idx" in *[!0-9]*)
+			rm -f "$t"
 			return 1
 			;;
 		esac
 		[ "$idx" -lt 1 ] || [ "$idx" -gt "$n" ] && {
-			printf '%s\n' "Номер вне диапазона: $idx (1–$n)" >&2
-			rm -f "$tmp"
+			rm -f "$t"
 			return 1
 		}
-		sed -n "${idx}p" "$sf" >>"$tmp"
+		sed -n "${idx}p" "$sf" >>"$t"
 	done
-	sort -u "$tmp" >"$outf"
-	rm -f "$tmp"
+	sort -u "$t" >"$outf"
+	rm -f "$t"
 	[ -s "$outf" ] || return 1
-	return 0
 }
 
-connect_pair() {
-	p="$1"
-	printf '%s ' "→ $DEFAULT_HOST1:$p ..."
-	adb connect "${DEFAULT_HOST1}:${p}" 2>/dev/null || printf '%s' "ошибка "
-	printf '%s ' "→ $DEFAULT_HOST2:$p ..."
-	adb connect "${DEFAULT_HOST2}:${p}" 2>/dev/null || printf '%s' "ошибка "
-	printf '\n'
-}
-
-# Проверка «что-то:порт» (IPv4:port или имя:port)
-is_adb_target() {
-	case "$1" in
-	*:*:*) return 0 ;; # возможно IPv6 — пусть adb сам разберётся
-	*:*)
-		hostpart=${1%%:*}
-		portpart=${1#*:}
-		[ -n "$hostpart" ] && [ -n "$portpart" ] || return 1
-		return 0
-		;;
-	*) return 1 ;;
-	esac
-}
-
-connect_explicit_list() {
-	for a in $CONNECT_LIST; do
-		printf '%s\n' "→ adb connect $a"
-		adb connect "$a" || printf '%s\n' "   ошибка" >&2
-	done
-}
-
-quick_batch() {
+# ─── Поиск (ядро) ───
+run_scan_connect() {
 	load_settings
-	ensure_adb
-	if [ -n "$CONNECT_LIST" ]; then
-		printf '%s\n' "--- Подключение (--connect) ---"
-		connect_explicit_list
-	else
-		printf '%s\n' "--- Подключение (порт $ADB_PORT, хосты по умолчанию) ---"
-		connect_pair "$ADB_PORT"
-	fi
-	printf '%s\n' "--- adb devices -l ---"
-	adb devices -l
-}
-
-menu_settings() {
-	load_settings
-	printf '%s\n' "--- Текущие настройки ---"
-	printf 'Порт ADB: %s\n' "$ADB_PORT"
-	printf 'Подсеть поиска: %s.x (хосты .1–.254)\n' "$SCAN_SUBNET"
-	printf '%s ' "Новый порт ADB [Enter = оставить]:"
-	read -r newp
-	if [ -n "$newp" ]; then
-		ADB_PORT=$newp
-	fi
-	printf '%s ' "Подсеть, три октета (напр. 192.168.1) [Enter = оставить]:"
-	read -r news
-	if [ -n "$news" ]; then
-		SCAN_SUBNET=$news
-	fi
-	ct=0
-	o1= o2= o3=
-	for o in $(printf '%s' "$SCAN_SUBNET" | tr '.' ' '); do
-		ct=$((ct + 1))
-		case $ct in 1) o1=$o ;; 2) o2=$o ;; 3) o3=$o ;; esac
-	done
-	if [ "$ct" -ne 3 ]; then
-		printf '%s\n' "Ошибка: нужно три октета, например 192.168.1" >&2
-		read -r _
-		return 1
-	fi
-	case "$o1$o2$o3" in
-	*[!0-9]*) printf '%s\n' "Ошибка: только цифры и точки в подсети" >&2; read -r _; return 1 ;;
-	esac
-	if ! printf '%s' "$ADB_PORT" | grep -q '^[0-9][0-9]*$' || [ "$ADB_PORT" -lt 1 ] || [ "$ADB_PORT" -gt 65535 ]; then
-		printf '%s\n' "Ошибка: порт 1–65535" >&2
-		read -r _
-		return 1
-	fi
-	save_settings
-	read -r _
-}
-
-menu_search() {
-	load_settings
-	ensure_adb
-	repeat_search=1
-	while [ "$repeat_search" -eq 1 ]; do
-		repeat_search=0
-		sub=$(printf '%s' "$SCAN_SUBNET" | sed 's/\.$//')
-		p="$ADB_PORT"
-		printf '%s\n' "--- Поиск: ${sub}.1–254, TCP $p ---"
-		found=$(mktemp) || exit 1
-		trap 'rm -f "$found"' EXIT INT
-
-		if command -v nc >/dev/null 2>&1; then
-			i=1
-			while [ "$i" -le 254 ]; do
-				ip="${sub}.${i}"
-				if probe_tcp "$ip" "$p"; then
-					printf '%s\n' "$ip" >>"$found"
-				fi
-				i=$((i + 1))
-			done
-		else
-			printf '%s\n' "(nc нет — перебор adb connect, может занять несколько минут)"
-			i=1
-			while [ "$i" -le 254 ]; do
-				ip="${sub}.${i}"
-				out=$(adb connect "${ip}:${p}" 2>&1) || true
-				case "$out" in
-				*connected* | *already*)
-					printf '%s\n' "$ip" >>"$found"
-					;;
-				esac
-				i=$((i + 1))
-			done
-		fi
-
-		n=$(wc -l <"$found" | tr -d ' ')
-		if [ "${n:-0}" -eq 0 ] || [ -z "$n" ]; then
-			printf '%s\n' "Открытых портов / успешных connect не найдено."
-		else
-			printf '%s\n' "Кандидатов: $n. Подключение adb..."
-			while read -r ip; do
-				[ -z "$ip" ] && continue
-				printf '%s\n' "  adb connect ${ip}:${p}"
-				adb connect "${ip}:${p}" || true
-			done <"$found"
-		fi
-		rm -f "$found"
-		trap - EXIT INT
-
-		post_search=1
-		while [ "$post_search" -eq 1 ]; do
-			printf '%s\n' ""
-			printf '%s\n' "--- Устройства (adb devices -l) ---"
-			adb devices -l
-			printf '%s\n' "----------------------------------------------"
-			printf '%s\n' "  1) Установить APK (выбор номеров устройств — см. шаг 2 в мастере)"
-			printf '%s\n' "  2) Повторить поиск в этой подсети"
-			printf '%s\n' "  0) Главное меню"
-			printf '%s\n' "----------------------------------------------"
-			printf '%s' "Дальше [0-2]: "
-			read -r subc || return 0
-			case "$subc" in
-			1)
-				menu_install --skip-connect
-				;;
-			2)
-				repeat_search=1
-				post_search=0
-				;;
-			0)
-				post_search=0
-				;;
-			*)
-				printf '%s\n' "Неверный ввод."
-				;;
-			esac
+	sub=$(printf '%s' "$SCAN_SUBNET" | sed 's/\.$//')
+	p="$ADB_PORT"
+	found=$(mktemp) || exit 1
+	if command -v nc >/dev/null 2>&1; then
+		i=1
+		while [ "$i" -le 254 ]; do
+			probe_tcp "${sub}.${i}" "$p" && printf '%s\n' "${sub}.${i}" >>"$found"
+			i=$((i + 1))
 		done
+	else
+		i=1
+		while [ "$i" -le 254 ]; do
+			ip="${sub}.${i}"
+			o=$(adb connect "${ip}:${p}" 2>&1) || true
+			case "$o" in *connected* | *already*) printf '%s\n' "$ip" >>"$found" ;; esac
+			i=$((i + 1))
+		done
+	fi
+	if [ -s "$found" ]; then
+		while read -r ip; do
+			[ -z "$ip" ] && continue
+			adb connect "${ip}:${p}" || true
+		done <"$found"
+	fi
+	rm -f "$found"
+}
+
+# ═══════════════ dialog UI ═══════════════
+dialog_main() {
+	ensure_adb
+	[ -n "$CONNECT_LIST" ] && connect_explicit_list
+	while true; do
+		load_settings
+		c=$(dialog --stdout --clear --colors \
+			--title "[ lunafast-fw-upload ] ─ Главное меню" \
+			--menu "Порт: $ADB_PORT  │  Подсеть: ${SCAN_SUBNET}.x\n\n↑↓ выбор, Enter — открыть раздел." 20 76 6 \
+			1 "Сеть › поиск устройств (скан LAN)" \
+			2 "Прошивка › вложенное меню (выбор целей, APK…)" \
+			3 "Настройки" \
+			4 "Просмотр: adb devices -l" \
+			0 "Выход") || true
+		ex=$?
+		[ "$ex" -eq 255 ] || [ "$ex" -eq 1 ] && break
+		case "$c" in
+		1) dialog_search_flow ;;
+		2) dialog_flash_menu ;;
+		3) dialog_settings ;;
+		4)
+			_tf=$(mktemp)
+			adb devices -l >"$_tf"
+			dialog --title "[ устройства ]" --textbox "$_tf" 22 78
+			rm -f "$_tf"
+			;;
+		0) break ;;
+		esac
 	done
 }
 
-menu_install() {
-	skipc=
-	if [ "$1" = "--skip-connect" ]; then
-		skipc=1
-		shift
-	fi
+dialog_search_flow() {
+	while true; do
+		load_settings
+		dialog --title "[ Сеть › поиск ]" --infobox "Сканирование ${SCAN_SUBNET}.x …" 6 50
+		run_scan_connect
+		_tf=$(mktemp)
+		adb devices -l >"$_tf"
+		dialog --title "[ Сеть › результат ]" --textbox "$_tf" 22 78
+		rm -f "$_tf"
+		a=$(dialog --stdout --title "[ Сеть › дальше ]" --menu "Действие после поиска:" 16 72 4 \
+			1 "Прошивка › установить APK (мастер)" \
+			2 "Повторить поиск" \
+			0 "◀ Назад в главное меню") || break
+		case "$a" in
+		1) dialog_install_wizard ;;
+		2) ;; # снова цикл — повторный скан
+		0) break ;;
+		esac
+	done
+}
+
+dialog_flash_menu() {
+	while true; do
+		b=$(dialog --stdout --clear \
+			--title "[ Прошивка ] ─ вложенное меню" \
+			--menu "Иерархия: Главная › Прошивка\n\n★ п.2 — только отметить устройства (Пробел в списке)." 19 76 7 \
+			1 "Подключить вручную: IP:PORT" \
+			2 "★ Выбор устройств для прошивки (checklist → сохранить)" \
+			3 "Установить APK на сохранённый список (после п.2)" \
+			4 "Мастер: connect → APK → checklist → установка" \
+			5 "Показать сохранённые цели" \
+			0 "◀ Назад в главное меню") || break
+		case "$b" in
+		1) dialog_connect_ip ;;
+		2) dialog_flash_checklist ;;
+		3) dialog_install_saved ;;
+		4) dialog_install_wizard ;;
+		5) dialog_show_saved ;;
+		0) break ;;
+		esac
+	done
+}
+
+dialog_connect_ip() {
+	addr=$(dialog --stdout --title "[ Прошивка › connect ]" \
+		--inputbox "ADB адрес как IP:PORT или host:PORT:" 10 70 "192.168.1.211:${ADB_PORT:-5555}") || return
+	[ -z "$addr" ] && return
+	is_adb_target "$addr" || {
+		dialog --msgbox "Нужен формат host:port" 6 40
+		return
+	}
+	adb connect "$addr"
+	dialog --msgbox "Команда выполнена. Проверьте список в главном меню (п.4)." 7 60
+}
+
+dialog_flash_checklist() {
 	load_settings
 	ensure_adb
-	printf '%s\n' "=================================================="
-	printf '%s\n' "  УСТАНОВКА APK — сначала файл, потом КТО из списка"
-	printf '%s\n' "=================================================="
-	if [ -z "$skipc" ]; then
-		printf '%s' "Шаг 0. ADB IP:PORT [Enter если уже подключено]: "
-		read -r addr_line
-		if [ -n "$addr_line" ]; then
-			if is_adb_target "$addr_line"; then
-				printf '%s\n' "→ adb connect $addr_line"
-				adb connect "$addr_line" || printf '%s\n' "предупреждение: connect не удался" >&2
-			else
-				printf '%s\n' "Нужен формат IP:PORT (например 192.168.1.211:5555)" >&2
-				read -r _
-				return 1
-			fi
-		fi
-	fi
-	sf=$(mktemp) || exit 1
-	picked=$(mktemp) || {
-		rm -f "$sf"
-		exit 1
-	}
+	sf=$(mktemp)
 	refresh_serials_file "$sf"
 	if [ ! -s "$sf" ]; then
-		printf '%s\n' "Нет устройств «device». Укажите IP:PORT выше или п.1 (поиск)."
-		rm -f "$sf" "$picked"
+		dialog --msgbox "Нет устройств в состоянии device." 6 50
+		rm -f "$sf"
+		return
+	fi
+	n=$(wc -l <"$sf" | tr -d ' ')
+	lh=$n
+	[ "$lh" -gt 12 ] && lh=12
+	h=$((lh + 8))
+	args=""
+	i=1
+	while read -r ser; do
+		[ -z "$ser" ] && continue
+		args="$args $i $ser off"
+		i=$((i + 1))
+	done <"$sf"
+	sel=$(dialog --stdout --separate-output \
+		--title "[ Прошивка › выбор целей ]" \
+		--checklist "Пробел — отметить / снять. Enter — OK." "$h" 78 "$lh" $args) || {
+		rm -f "$sf"
+		return
+	}
+	out=$(selected_targets_file)
+	mkdir -p "$(dirname "$out")"
+	: >"$out"
+	for t in $sel; do
+		sed -n "${t}p" "$sf" >>"$out"
+	done
+	rm -f "$sf"
+	nc=$(wc -l <"$out" | tr -d ' ')
+	if [ "${nc:-0}" -eq 0 ]; then
+		dialog --msgbox "Ничего не отмечено." 5 40
+		return
+	fi
+	dialog --msgbox "Сохранено устройств: $nc\nДалее: п.3 «Установить APK на сохранённый список»." 8 65
+}
+
+dialog_show_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Список целей пуст. Используйте п.2." 6 50
+		return
+	fi
+	dialog --title "[ сохранённые serial ]" --textbox "$f" 16 72
+}
+
+dialog_install_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.2 — выбор устройств." 7 55
+		return
+	fi
+	apk=$(dialog --stdout --title "[ APK ]" --inputbox "Путь к .apk или имя из каталога apks/:" 11 72 "") || return
+	[ -z "$apk" ] && return
+	ap=$apk
+	[ ! -f "$ap" ] && [ -f "apks/$apk" ] && ap="apks/$apk"
+	if [ ! -f "$ap" ]; then
+		dialog --msgbox "Файл не найден: $apk" 6 50
+		return
+	fi
+	dialog --yesno "Установить $(basename "$ap") на отмеченные устройства?" 7 65 || return
+	err=0
+	while read -r s; do
+		[ -z "$s" ] && continue
+		adb -s "$s" install -r "$ap" || err=1
+	done <"$f"
+	[ "$err" -eq 0 ] && dialog --msgbox "Готово." 5 35 || dialog --msgbox "Были ошибки (см. вывод adb)." 6 45
+}
+
+dialog_install_wizard() {
+	load_settings
+	ensure_adb
+	addr=$(dialog --stdout --title "[ Мастер ]" --inputbox "ADB IP:PORT [пусто — пропуск]:" 10 70 "") || return
+	if [ -n "$addr" ] && is_adb_target "$addr"; then
+		adb connect "$addr" || true
+	fi
+	apk=$(dialog --stdout --inputbox "Путь к APK:" 10 70 "") || return
+	[ -z "$apk" ] && return
+	ap=$apk
+	[ ! -f "$ap" ] && [ -f "apks/$apk" ] && ap="apks/$apk"
+	if [ ! -f "$ap" ]; then
+		dialog --msgbox "Файл не найден." 5 35
+		return
+	fi
+	sf=$(mktemp)
+	refresh_serials_file "$sf"
+	if [ ! -s "$sf" ]; then
+		rm -f "$sf"
+		dialog --msgbox "Нет device." 5 35
+		return
+	fi
+	n=$(wc -l <"$sf" | tr -d ' ')
+	lh=$n
+	[ "$lh" -gt 12 ] && lh=12
+	h=$((lh + 8))
+	args=""
+	i=1
+	while read -r ser; do
+		[ -z "$ser" ] && continue
+		args="$args $i $ser off"
+		i=$((i + 1))
+	done <"$sf"
+	selmust=$(dialog --stdout --separate-output \
+		--title "[ Мастер › куда ставить ]" \
+		--checklist "Отметьте устройства для $(basename "$ap")" "$h" 78 "$lh" $args) || {
+		rm -f "$sf"
+		return
+	}
+	p=$(mktemp)
+	: >"$p"
+	for t in $selmust; do
+		sed -n "${t}p" "$sf" >>"$p"
+	done
+	rm -f "$sf"
+	[ ! -s "$p" ] && {
+		rm -f "$p"
+		dialog --msgbox "Не выбрано ни одного." 5 40
+		return
+	}
+	dialog --yesno "Подтвердить установку?" 6 50 || {
+		rm -f "$p"
+		return
+	}
+	err=0
+	while read -r s; do
+		[ -z "$s" ] && continue
+		adb -s "$s" install -r "$ap" || err=1
+	done <"$p"
+	rm -f "$p"
+	[ "$err" -eq 0 ] && dialog --msgbox "Готово." 5 35 || dialog --msgbox "Ошибки при установке." 6 40
+}
+
+dialog_settings() {
+	load_settings
+	p=$(dialog --stdout --inputbox "Порт ADB:" 8 60 "$ADB_PORT") || return
+	[ -n "$p" ] && ADB_PORT=$p
+	s=$(dialog --stdout --inputbox "Подсеть (3 октета):" 8 60 "$SCAN_SUBNET") || return
+	[ -n "$s" ] && SCAN_SUBNET=$s
+	save_settings
+	dialog --msgbox "Сохранено." 5 35
+}
+
+# ═══════════════ текст: псевдографика ═══════════════
+text_hline() {
+	w=$1
+	j=0
+	printf '┌'
+	while [ "$j" -lt "$w" ]; do
+		printf '─'
+		j=$((j + 1))
+	done
+	printf '┐\n'
+}
+
+text_hline_mid() {
+	w=$1
+	j=0
+	printf '├'
+	while [ "$j" -lt "$w" ]; do
+		printf '─'
+		j=$((j + 1))
+	done
+	printf '┤\n'
+}
+
+text_hline_bot() {
+	w=$1
+	j=0
+	printf '└'
+	while [ "$j" -lt "$w" ]; do
+		printf '─'
+		j=$((j + 1))
+	done
+	printf '┘\n'
+}
+
+text_flash_menu_txt() {
+	while true; do
+		printf '\n'
+		text_hline 58
+		printf '│ %s\n' " lunafast ▶ Прошивка (вложенное меню)                    │"
+		text_hline_mid 58
+		printf '│  1) Подключить IP:PORT                                   │\n'
+		printf '│  2) ★ Выбор устройств → файл (для п.3)                   │\n'
+		printf '│  3) Установить APK на сохранённый список                 │\n'
+		printf '│  4) Мастер (connect → APK → номера)                      │\n'
+		printf '│  5) Показать сохранённые serial                          │\n'
+		printf '│  0) ◀ Назад                                              │\n'
+		text_hline_bot 58
+		printf '%s' "Выбор [0-5]: "
+		read -r b || return
+		case "$b" in
+		1)
+			printf '%s' "IP:PORT: "
+			read -r a || return
+			[ -n "$a" ] && is_adb_target "$a" && adb connect "$a"
+			;;
+		2) text_flash_checklist_txt ;;
+		3) text_install_saved_txt ;;
+		4) menu_install_text ;;
+		5)
+			f=$(selected_targets_file)
+			if [ -s "$f" ]; then cat "$f"; else printf '%s\n' "(пусто)"; fi
+			read -r _
+			;;
+		0) break ;;
+		esac
+	done
+}
+
+text_flash_checklist_txt() {
+	load_settings
+	sf=$(mktemp)
+	refresh_serials_file "$sf"
+	if [ ! -s "$sf" ]; then
+		printf '%s\n' "Нет device."
+		rm -f "$sf"
 		read -r _
 		return
 	fi
-	printf '%s\n' ""
-	printf '%s' "Шаг 1. Путь к APK или имя из ./apks: "
-	read -r path_in
-	if [ -z "$path_in" ]; then
-		rm -f "$sf" "$picked"
+	printf '%s\n' "Отметьте номера через пробел (Enter = все):"
+	print_numbered_txt "$sf"
+	printf '%s' "Номера: "
+	read -r pick || {
+		rm -f "$sf"
+		return
+	}
+	out=$(selected_targets_file)
+	mkdir -p "$(dirname "$out")"
+	p=$(mktemp)
+	if ! pick_serials_to_file "$sf" "$pick" "$p"; then
+		rm -f "$sf" "$p"
 		read -r _
 		return
 	fi
-	apk=$path_in
-	if [ ! -f "$apk" ] && [ -f "apks/$path_in" ]; then
-		apk="apks/$path_in"
-	fi
-	if [ ! -f "$apk" ]; then
-		printf '%s\n' "Файл не найден: $path_in" >&2
-		rm -f "$sf" "$picked"
-		read -r _
-		return
-	fi
-	banner_pick_devices
-	print_numbered_serials "$sf"
-	printf '%s\n' "  --------------------------------------------------"
-	printf '%s\n' "  Шаг 2. КУДА ставим $(basename "$apk")?"
-	printf '%s\n' "    Enter или «все» = на ВСЕ перечисленные"
-	printf '%s\n' "    Или номера: одно (1) или несколько через пробел/запятую (1 3  или  1,2)"
-	printf '%s\n' "  --------------------------------------------------"
-	printf '%s' "  Ваш выбор номеров: "
-	read -r pick_in
-	if ! pick_serials_to_file "$sf" "$pick_in" "$picked"; then
-		rm -f "$sf" "$picked"
-		read -r _
-		return 1
-	fi
-	tlist=$(tr '\n' ' ' <"$picked")
-	printf '%s\n' ""
-	printf '%s' "Подтвердить: $(basename "$apk") → устройства: $tlist ? [y/N]: "
-	read -r y
-	case "$y" in
-	y | Y | yes | YES | д | Д | да | Да) ;;
-	*)
-		rm -f "$sf" "$picked"
-		read -r _
-		return
-		;;
-	esac
-	while read -r serial; do
-		[ -z "$serial" ] && continue
-		printf '%s\n' ">>> $serial"
-		adb -s "$serial" install -r "$apk" || printf '%s\n' "  ошибка" >&2
-	done <"$picked"
-	rm -f "$sf" "$picked"
-	printf '%s\n' "Готово. Enter..."
+	mv "$p" "$out"
+	rm -f "$sf"
+	printf '%s\n' "Сохранено в $out"
 	read -r _
 }
 
-main_menu() {
-	ensure_adb
-	if [ -n "$CONNECT_LIST" ]; then
-		printf '%s\n' "--- Старт: adb connect (--connect) ---"
-		connect_explicit_list
+text_install_saved_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.2 выбора."
+		read -r _
+		return
 	fi
-	while :; do
+	printf '%s' "Путь к APK: "
+	read -r path || return
+	[ -z "$path" ] && return
+	ap=$path
+	[ ! -f "$ap" ] && [ -f "apks/$path" ] && ap="apks/$path"
+	if [ ! -f "$ap" ]; then
+		printf '%s\n' "Нет файла"
+		read -r _
+		return
+	fi
+	while read -r s; do
+		[ -z "$s" ] && continue
+		adb -s "$s" install -r "$ap" || true
+	done <"$f"
+	read -r _
+}
+
+print_numbered_txt() {
+	sf=$1
+	i=1
+	while read -r L; do
+		[ -z "$L" ] && continue
+		printf '   %s) %s\n' "$i" "$L"
+		i=$((i + 1))
+	done <"$sf"
+}
+
+menu_install_text() {
+	load_settings
+	printf '%s' "IP:PORT [Enter пропуск]: "
+	read -r addr
+	[ -n "$addr" ] && is_adb_target "$addr" && adb connect "$addr"
+	sf=$(mktemp)
+	p=$(mktemp)
+	refresh_serials_file "$sf"
+	if [ ! -s "$sf" ]; then
+		rm -f "$sf" "$p"
+		read -r _
+		return
+	fi
+	printf '%s' "APK: "
+	read -r apk || {
+		rm -f "$sf" "$p"
+		return
+	}
+	ap=$apk
+	[ ! -f "$ap" ] && [ -f "apks/$apk" ] && ap="apks/$apk"
+	if [ ! -f "$ap" ]; then
+		rm -f "$sf" "$p"
+		read -r _
+		return
+	fi
+	print_numbered_txt "$sf"
+	printf '%s' "Номера устройств [Enter=all]: "
+	read -r pick
+	pick_serials_to_file "$sf" "$pick" "$p" || {
+		rm -f "$sf" "$p"
+		read -r _
+		return
+	}
+	rm -f "$sf"
+	while read -r s; do
+		[ -z "$s" ] && continue
+		adb -s "$s" install -r "$ap" || true
+	done <"$p"
+	rm -f "$p"
+	read -r _
+}
+
+menu_settings_text() {
+	load_settings
+	printf '%s' "Порт [ $ADB_PORT ]: "
+	read -r n
+	[ -n "$n" ] && ADB_PORT=$n
+	printf '%s' "Подсеть [ $SCAN_SUBNET ]: "
+	read -r s
+	[ -n "$s" ] && SCAN_SUBNET=$s
+	save_settings
+	printf '%s\n' "Сохранено: $(settings_file)"
+	read -r _
+}
+
+text_search_flow() {
+	load_settings
+	printf '%s\n' "… скан …"
+	run_scan_connect
+	adb devices -l
+	while true; do
+		printf '%s\n' "  1) Мастер прошивки  2) Повтор  0) Назад"
+		printf '%s' "? "
+		read -r z || return
+		case "$z" in
+		1) menu_install_text ;;
+		2) text_search_flow; return ;;
+		0) break ;;
+		esac
+	done
+}
+
+text_main() {
+	ensure_adb
+	[ -n "$CONNECT_LIST" ] && connect_explicit_list
+	while true; do
 		load_settings
 		printf '\n'
-		printf '%s\n' "--- Уже подключённые устройства (adb devices -l) ---"
+		text_hline 58
+		printf '│ %s\n' " lunafast-fw-upload │ Главное меню (текст)              │"
+		text_hline_mid 58
+		printf '│  1) Сеть › поиск                                       │\n'
+		printf '│  2) Прошивка › вложенное меню                          │\n'
+		printf '│  3) Настройки                                          │\n'
+		printf '│  4) adb devices -l                                     │\n'
+		printf '│  0) Выход                                              │\n'
+		text_hline_bot 58
 		adb devices -l
-		printf '%s\n' "=============================================="
-		printf '%s\n' "  lunafast-fw-upload"
-		printf '%s\n' "  Порт $ADB_PORT   Подсеть ${SCAN_SUBNET}.x"
-		printf '%s\n' "=============================================="
-		printf '%s\n' "  1) Поиск устройств в сети"
-		printf '%s\n' "  2) Установка APK — выбор устройств по номерам, затем файл"
-		printf '%s\n' "  3) Настройки (порт ADB, подсеть)"
-		printf '%s\n' "  0) Выход"
-		printf '%s\n' "=============================================="
-		printf '%s' "Выбор [0-3]: "
+		printf '%s' "[0-4]: "
 		read -r c || exit 0
 		case "$c" in
-		1) menu_search ;;
-		2) menu_install ;;
-		3) menu_settings ;;
-		0) printf '%s\n' "Выход."; exit 0 ;;
-		*) printf '%s\n' "Неверный пункт. Enter..."; read -r _ ;;
+		1) text_search_flow ;;
+		2) text_flash_menu_txt ;;
+		3) menu_settings_text ;;
+		4) ;;
+		0) exit 0 ;;
 		esac
 	done
 }
 
 install_apk_batch() {
-	apk=$1
-	if [ ! -f "$apk" ]; then
-		printf '%s\n' "Нет файла: $apk" >&2
-		exit 1
-	fi
+	[ -f "$1" ] || exit 1
 	load_settings
 	ensure_adb
-	if [ -n "$CONNECT_LIST" ]; then
-		printf '%s\n' "--- adb connect (--connect) ---"
-		connect_explicit_list
-	fi
+	[ -n "$CONNECT_LIST" ] && connect_explicit_list
 	list=$(adb_device_serials)
-	if [ -z "$list" ]; then
-		printf '%s\n' "Нет устройств." >&2
-		exit 1
-	fi
-	err=0
-	for serial in $list; do
-		printf '%s\n' ">>> $serial"
-		adb -s "$serial" install -r "$apk" || err=1
+	[ -z "$list" ] && exit 1
+	e=0
+	for s in $list; do
+		adb -s "$s" install -r "$1" || e=1
 	done
-	exit "$err"
+	exit "$e"
 }
 
+# ═══ entry ═══
 MENU=
 NO_UI=
 APK=
@@ -474,63 +675,33 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 	--connect)
 		shift
-		if [ -z "$1" ]; then
-			printf '%s\n' "Ожидается IP:PORT после --connect" >&2
-			exit 1
-		fi
-		if ! is_adb_target "$1"; then
-			printf '%s\n' "Неверный адрес (нужно IP:PORT или host:PORT): $1" >&2
-			exit 1
-		fi
+		[ -z "$1" ] && exit 1
+		is_adb_target "$1" || exit 1
 		CONNECT_LIST="$CONNECT_LIST${CONNECT_LIST:+ }$1"
 		shift
 		;;
-	-m | --menu)
-		MENU=1
-		shift
-		;;
-	--no-ui)
-		NO_UI=1
-		shift
-		;;
-	-h | --help)
-		usage
-		exit 0
-		;;
-	--)
-		shift
-		break
-		;;
-	-*)
-		printf '%s\n' "Неизвестно: $1" >&2
-		usage >&2
-		exit 1
-		;;
-	*)
-		break
-		;;
+	-m | --menu) MENU=1; shift ;;
+	--no-ui) NO_UI=1; shift ;;
+	-h | --help) usage; exit 0 ;;
+	--) shift; break ;;
+	-*) usage >&2; exit 1 ;;
+	*) break ;;
 	esac
 done
 
 [ $# -gt 0 ] && APK=$1
 
-if [ -n "$APK" ]; then
-	install_apk_batch "$APK"
-	exit $?
-fi
+if [ -n "$APK" ]; then install_apk_batch "$APK"; exit $?; fi
+if [ -n "$NO_UI" ]; then quick_batch; exit 0; fi
 
-if [ -n "$NO_UI" ]; then
-	quick_batch
-	exit 0
-fi
-
-if [ -n "$MENU" ] || { [ -z "$APK" ] && [ -t 0 ] && [ -t 1 ]; }; then
-	if [ ! -t 0 ] || [ ! -t 1 ]; then
-		printf '%s\n' "Нужен TTY для меню. Используйте tablet_deploy.sh --no-ui" >&2
-		exit 1
-	fi
+if [ -n "$MENU" ] || { [ -t 0 ] && [ -t 1 ]; }; then
 	ensure_adb
-	main_menu
+	if ! have_dialog; then
+		printf '%s\n' "Подсказка: apt install dialog — меню со стрелками и checklist."
+		text_main
+	else
+		dialog_main
+	fi
 	exit 0
 fi
 
