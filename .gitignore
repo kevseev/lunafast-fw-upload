@@ -1,3 +1,6 @@
+# Журнал установок (дописывает tablet_deploy.sh)
+lunafast_install.log
+
 # APK
 apks/*
 !apks/.gitkeep
