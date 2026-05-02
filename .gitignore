@@ -11,3 +11,6 @@ venv/
 # APK и артефакты в точке монтирования
 apks/*
 !apks/.gitkeep
+
+# Локальные артефакты релиза (образ не коммитим)
+/lunafast-tablet-deploy-*.tar.gz

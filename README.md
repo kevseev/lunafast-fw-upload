@@ -76,6 +76,16 @@ docker compose run --rm tablet-deploy /apks/my-application.apk
 docker compose run --rm tablet-deploy --no-ui --model Samsung /apks/app.apk
 ```
 
+## Релизы: готовый образ без сборки
+
+На странице **[Releases](https://github.com/kevseev/lunafast-fw-upload/releases)** выкладываются:
+
+- **`lunafast-tablet-deploy-vVERSION.tar.gz`** — полный образ (`docker load`);
+- **`MANUAL.md`** — пошаговая установка и запуск;
+- **`docker-compose.yml`** — из каталога `release/` в репозитории (тот же файл прикладывается к релизу для скачивания одним архивом распространения).
+
+Подробности — в **`MANUAL.md`**.
+
 ## Структура репозитория
 
 | Файл / каталог   | Назначение                          |
@@ -84,6 +94,8 @@ docker compose run --rm tablet-deploy --no-ui --model Samsung /apks/app.apk
 | `requirements.txt` | Зависимости Python                |
 | `Dockerfile`     | Образ с Python, `adb`, зависимостями |
 | `docker-compose.yml` | Запуск с `./apks` и host-сетью |
+| `release/docker-compose.yml` | Только `image:` — для использования с архивом из релиза |
+| `MANUAL.md`      | Ручное руководство для установки из релиза |
 | `apks/`          | Каталог для APK (не коммитятся бинарники) |
 
 ## Публикация и релиз на GitHub
