@@ -398,6 +398,8 @@ main_menu() {
 	while :; do
 		load_settings
 		printf '\n'
+		printf '%s\n' "--- Уже подключённые устройства (adb devices -l) ---"
+		adb devices -l
 		printf '%s\n' "=============================================="
 		printf '%s\n' "  lunafast-fw-upload"
 		printf '%s\n' "  Порт $ADB_PORT   Подсеть ${SCAN_SUBNET}.x"
