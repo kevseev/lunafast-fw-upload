@@ -5,5 +5,9 @@ lunafast_install.log
 apks/*
 !apks/.gitkeep
 
+# Контейнеры КриптоПро / архивы (кладите локально; не коммитить)
+certs/*
+!certs/.gitkeep
+
 __pycache__/
 *.py[cod]

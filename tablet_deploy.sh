@@ -6,6 +6,9 @@
 set_defaults() {
 	ADB_PORT=5555
 	SCAN_SUBNET=192.168.1
+	LAUNCH_PACKAGE=
+	HEALTH_PORT=8080
+	HEALTH_PATH=/healthcheck
 }
 
 DEFAULT_HOST1=192.168.1.211
@@ -41,6 +44,9 @@ load_settings() {
 	fi
 	: "${ADB_PORT:=5555}"
 	: "${SCAN_SUBNET:=192.168.1}"
+	: "${LAUNCH_PACKAGE:=}"
+	: "${HEALTH_PORT:=8080}"
+	: "${HEALTH_PATH:=/healthcheck}"
 }
 
 save_settings() {
@@ -49,6 +55,9 @@ save_settings() {
 	{
 		printf 'ADB_PORT=%s\n' "$ADB_PORT"
 		printf 'SCAN_SUBNET=%s\n' "$SCAN_SUBNET"
+		printf 'LAUNCH_PACKAGE=%s\n' "$LAUNCH_PACKAGE"
+		printf 'HEALTH_PORT=%s\n' "$HEALTH_PORT"
+		printf 'HEALTH_PATH=%s\n' "$HEALTH_PATH"
 	} >"$SETTINGS_FILE" || exit
 }
 
@@ -153,6 +162,10 @@ usage() {
 
   Журнал: lunafast_install.log — новые записи добавляются в начало файла (сверху последняя операция).
 
+  КриптоПро: Прошивка п.7 — PUT http://<IP>:HEALTH_PORT/cryptopro/upload/container (curl -F container=@файл из certs/ -F password=…), список устройств как для APK (п.2).
+
+  Health: главное меню п.7 — GET http://<host из serial>:HEALTH_PORT+HEALTH_PATH (по умолчанию :8080/healthcheck), колонки ОК/НЕ ОК; нужны curl или wget на ПК.
+
   UI без dialog: текстовые рамки. apt install dialog (Debian/Ubuntu).
 В меню: серо-белая тема; при установке APK — шкала до 100% только после успешного pm install (копирование ≈0–85%, по %/байтам из adb или оценочно). XAPK: unzip."
 }
@@ -241,6 +254,30 @@ lunafast_log_push_output() {
 	} >>"$_logf"
 }
 
+# После успешного install: pidof и фрагмент activity по пакету (ещё без am start процесс часто отсутствует — это норма).
+lunafast_log_pkg_running_probe() {
+	_serial=$1
+	_pkg=$2
+	_log=$3
+	{
+		printf '%s\n' "--- проверка запущенности: $_pkg ---"
+		printf '%s\n' "--- shell pidof ---"
+		_po=$(lunafast_adb_linebuf -s "$_serial" shell pidof "$_pkg" 2>&1 || true)
+		printf '%s\n' "$_po"
+		_po_trim=$(lunafast_trim "$_po")
+		if printf '%s' "$_po_trim" | grep -q '[0-9]'; then
+			printf '%s\n' "--- итог: процесс(ы) в памяти (см. pid выше)"
+		else
+			printf '%s\n' "--- итог: процесс не найден — ожидаемо после install, если приложение не открывали"
+		fi
+		printf '%s\n' "--- activity activities (строки с пакетом, до 8 строк) ---"
+		lunafast_adb_linebuf -s "$_serial" shell dumpsys activity activities 2>/dev/null \
+			| grep -F "$_pkg" | head -8 \
+			|| printf '%s\n' "(нет совпадений в выборке dumpsys)"
+		printf '%s\n' ""
+	} >>"$_log" 2>&1
+}
+
 # pm после push — в журнал (для объединённой шкалы с копированием)
 lunafast_pm_steps_to_log() {
 	_s=$1
@@ -259,8 +296,8 @@ lunafast_pm_steps_to_log() {
 			_pp=$(lunafast_adb_linebuf -s "$_s" shell pm path "$_pkg" 2>/dev/null) || _pp=
 			case "$_pp" in
 			package:*)
-				printf '%s\n' "--- pm uninstall (снять текущую/старую версию) ---"
-				lunafast_adb_linebuf -s "$_s" uninstall "$_pkg" 2>&1 || lunafast_adb_linebuf -s "$_s" shell pm uninstall --user 0 "$_pkg" 2>&1 || true
+				printf '%s\n' "--- уже установлен — обновление через pm install -r … (удаление пакета не выполняется) ---"
+				printf '%s\n' "$_pp"
 				;;
 			*)
 				printf '%s\n' "(пакет на устройстве не найден — ставим с нуля)"
@@ -278,8 +315,9 @@ lunafast_pm_steps_to_log() {
 			lunafast_adb_linebuf -s "$_s" shell pm list packages -f 2>&1 | grep -F "$_pkg" || printf '%s\n' "(пакет не в list — см. выше)"
 			printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 			lunafast_adb_linebuf -s "$_s" shell dumpsys package "$_pkg" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+			lunafast_log_pkg_running_probe "$_s" "$_pkg" "$_log"
 		elif [ "$ec" -eq 0 ]; then
-			printf '%s\n' "(Имя пакета неизвестно — pm verify пропуск.)"
+			printf '%s\n' "(Имя пакета неизвестно — pm verify и проверка запущенности пропуск.)"
 		else
 			printf '%s\n' "ОШИБКА установки — см. вывод adb выше."
 		fi
@@ -538,8 +576,8 @@ if [ "$ec" -eq 0 ]; then
 		_ppath=$(run_adb -s "$LUNAFAST_S" shell pm path "$LUNAFAST_PKG" 2>/dev/null) || _ppath=
 		case "$_ppath" in
 		package:*)
-			printf '%s\n' "--- pm uninstall (снять текущую/старую версию) ---"
-			run_adb -s "$LUNAFAST_S" uninstall "$LUNAFAST_PKG" 2>&1 || run_adb -s "$LUNAFAST_S" shell pm uninstall --user 0 "$LUNAFAST_PKG" 2>&1 || true
+			printf '%s\n' "--- уже установлен — обновление через pm install -r … (удаление пакета не выполняется) ---"
+			printf '%s\n' "$_ppath"
 			;;
 		*)
 			printf '%s\n' "(пакет на устройстве не найден — ставим с нуля)"
@@ -558,6 +596,20 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 	run_adb -s "$LUNAFAST_S" shell pm list packages -f 2>&1 | grep -F "$LUNAFAST_PKG" || printf '%s\n' "(пакет не в list — см. выше)"
 	printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 	run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+	printf '%s\n' "--- проверка запущенности: $LUNAFAST_PKG ---"
+	printf '%s\n' "--- shell pidof ---"
+	_po=$(run_adb -s "$LUNAFAST_S" shell pidof "$LUNAFAST_PKG" 2>&1 || true)
+	printf '%s\n' "$_po"
+	case "$_po" in *[0-9]*)
+		printf '%s\n' "--- итог: процесс(ы) в памяти (см. pid выше)" ;;
+	*)
+		printf '%s\n' "--- итог: процесс не найден — ожидаемо после install, если приложение не открывали" ;;
+	esac
+	printf '%s\n' "--- activity activities (строки с пакетом, до 8 строк) ---"
+	run_adb -s "$LUNAFAST_S" shell dumpsys activity activities 2>/dev/null \
+		| grep -F "$LUNAFAST_PKG" | head -8 \
+		|| printf '%s\n' "(нет совпадений в выборке dumpsys)"
+	printf '%s\n' ""
 elif [ "$ec" -eq 0 ]; then
 	printf '%s\n' "(Имя пакета неизвестно — pm verify пропуск.)"
 else
@@ -597,8 +649,8 @@ if [ -n "${LUNAFAST_PKG:-}" ]; then
 	_ppath=$(run_adb -s "$LUNAFAST_S" shell pm path "$LUNAFAST_PKG" 2>/dev/null) || _ppath=
 	case "$_ppath" in
 	package:*)
-		printf '%s\n' "--- pm uninstall (снять текущую/старую версию) ---"
-		run_adb -s "$LUNAFAST_S" uninstall "$LUNAFAST_PKG" 2>&1 || run_adb -s "$LUNAFAST_S" shell pm uninstall --user 0 "$LUNAFAST_PKG" 2>&1 || true
+		printf '%s\n' "--- уже установлен — обновление через pm install -r … (удаление пакета не выполняется) ---"
+		printf '%s\n' "$_ppath"
 		;;
 	*)
 		printf '%s\n' "(пакет на устройстве не найден — ставим с нуля)"
@@ -616,6 +668,20 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 	run_adb -s "$LUNAFAST_S" shell pm list packages -f 2>&1 | grep -F "$LUNAFAST_PKG" || printf '%s\n' "(пакет не в list — см. выше)"
 	printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 	run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+	printf '%s\n' "--- проверка запущенности: $LUNAFAST_PKG ---"
+	printf '%s\n' "--- shell pidof ---"
+	_po=$(run_adb -s "$LUNAFAST_S" shell pidof "$LUNAFAST_PKG" 2>&1 || true)
+	printf '%s\n' "$_po"
+	case "$_po" in *[0-9]*)
+		printf '%s\n' "--- итог: процесс(ы) в памяти (см. pid выше)" ;;
+	*)
+		printf '%s\n' "--- итог: процесс не найден — ожидаемо после install, если приложение не открывали" ;;
+	esac
+	printf '%s\n' "--- activity activities (строки с пакетом, до 8 строк) ---"
+	run_adb -s "$LUNAFAST_S" shell dumpsys activity activities 2>/dev/null \
+		| grep -F "$LUNAFAST_PKG" | head -8 \
+		|| printf '%s\n' "(нет совпадений в выборке dumpsys)"
+	printf '%s\n' ""
 elif [ "$ec" -eq 0 ]; then
 	printf '%s\n' "(Имя пакета неизвестно — pm verify пропуск.)"
 else
@@ -657,8 +723,8 @@ if [ -n "${LUNAFAST_PKG:-}" ]; then
 	_ppath=$(run_adb -s "$LUNAFAST_S" shell pm path "$LUNAFAST_PKG" 2>/dev/null) || _ppath=
 	case "$_ppath" in
 	package:*)
-		printf '%s\n' "--- pm uninstall (снять текущую/старую версию) ---"
-		run_adb -s "$LUNAFAST_S" uninstall "$LUNAFAST_PKG" 2>&1 || run_adb -s "$LUNAFAST_S" shell pm uninstall --user 0 "$LUNAFAST_PKG" 2>&1 || true
+		printf '%s\n' "--- уже установлен — обновление через install-multiple -r … (удаление пакета не выполняется) ---"
+		printf '%s\n' "$_ppath"
 		;;
 	*)
 		printf '%s\n' "(пакет на устройстве не найден — ставим с нуля)"
@@ -684,6 +750,20 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 	run_adb -s "$LUNAFAST_S" shell pm list packages -f 2>&1 | grep -F "$LUNAFAST_PKG" || printf '%s\n' "(пакет не в list)"
 	printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 	run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+	printf '%s\n' "--- проверка запущенности: $LUNAFAST_PKG ---"
+	printf '%s\n' "--- shell pidof ---"
+	_po=$(run_adb -s "$LUNAFAST_S" shell pidof "$LUNAFAST_PKG" 2>&1 || true)
+	printf '%s\n' "$_po"
+	case "$_po" in *[0-9]*)
+		printf '%s\n' "--- итог: процесс(ы) в памяти (см. pid выше)" ;;
+	*)
+		printf '%s\n' "--- итог: процесс не найден — ожидаемо после install, если приложение не открывали" ;;
+	esac
+	printf '%s\n' "--- activity activities (строки с пакетом, до 8 строк) ---"
+	run_adb -s "$LUNAFAST_S" shell dumpsys activity activities 2>/dev/null \
+		| grep -F "$LUNAFAST_PKG" | head -8 \
+		|| printf '%s\n' "(нет совпадений в выборке dumpsys)"
+	printf '%s\n' ""
 elif [ "$ec" -ne 0 ]; then
 	printf '%s\n' "ОШИБКА установки — см. вывод adb выше."
 fi
@@ -747,6 +827,31 @@ resolve_installable_path() {
 	raw=$1
 	[ -z "$raw" ] && return 1
 	for c in "$raw" "apks/$raw"; do
+		if [ -f "$c" ]; then
+			apk_abspath "$c"
+			return $?
+		fi
+	done
+	return 1
+}
+
+# Архивы контейнера в certs/ (для КриптоПро upload)
+collect_cert_candidates() {
+	{
+		if [ -d certs ]; then
+			find certs -maxdepth 8 -type f 2>/dev/null
+		fi
+	} | while read -r L; do
+		[ -z "$L" ] && continue
+		norm=$(apk_abspath "$L" 2>/dev/null) || norm=$L
+		printf '%s\n' "$norm"
+	done | sort -u
+}
+
+resolve_cert_container_path() {
+	raw=$1
+	[ -z "$raw" ] && return 1
+	for c in "$raw" "certs/$raw"; do
 		if [ -f "$c" ]; then
 			apk_abspath "$c"
 			return $?
@@ -861,7 +966,62 @@ dialog_pick_install_package() {
 	printf '%s\n' "$sel"
 }
 
-# Упорядочить APK из распакованного XAPK (base первым)
+# Выбор файла контейнера в certs/ + ручной путь
+dialog_pick_cert_container() {
+	title=$1
+	pf=$(mktemp) || return 1
+	collect_cert_candidates >"$pf" || true
+	if [ ! -s "$pf" ]; then
+		rm -f "$pf"
+		res=$(dialog --stdout --clear --colors --title "$title" \
+			--inputbox "Путь к архиву контейнера (в certs/ файлов не найдено):" 12 74 "") || return 1
+		[ -z "$res" ] && return 1
+		ap=$(resolve_cert_container_path "$res") || {
+			dialog --msgbox "Файл не найден: $res" 6 50
+			return 1
+		}
+		printf '%s\n' "$ap"
+		return 0
+	fi
+	n=$(wc -l <"$pf" | tr -d ' ')
+	manual=$((n + 1))
+	mh=$n
+	[ "$mh" -gt 14 ] && mh=14
+	tot=$((mh + 9))
+	[ "$tot" -gt 26 ] && tot=26
+	i=1
+	set --
+	while read -r pth; do
+		[ -z "$pth" ] && continue
+		set -- "$@" "$i" "$(basename "$pth")"
+		i=$((i + 1))
+	done <"$pf"
+	set -- "$@" "$manual" "Другой путь…"
+	tag=$(dialog --stdout --clear --colors --title "$title" \
+		--menu "Каталог certs/ (↑↓, Enter). Пробел не нужен." "$tot" 80 "$mh" "$@") || {
+		rm -f "$pf"
+		return 1
+	}
+	tag=$(printf '%s' "$tag" | tr -d '\r\n')
+	if [ "$tag" -eq "$manual" ] 2>/dev/null; then
+		rm -f "$pf"
+		res=$(dialog --stdout --clear --colors --title "$title" \
+			--inputbox "Полный путь или имя в certs/:" 11 74 "") || return 1
+		[ -z "$res" ] && return 1
+		ap=$(resolve_cert_container_path "$res") || {
+			dialog --msgbox "Файл не найден: $res" 6 50
+			return 1
+		}
+		printf '%s\n' "$ap"
+		return 0
+	fi
+	sel=$(sed -n "${tag}p" "$pf")
+	rm -f "$pf"
+	case "$tag" in *[!0-9]*) return 1 ;; esac
+	[ "$tag" -lt 1 ] 2>/dev/null || [ "$tag" -gt "$n" ] 2>/dev/null && return 1
+	[ -z "$sel" ] && return 1
+	printf '%s\n' "$sel"
+}
 xapk_ordered_apk_list() {
 	root=$1
 	out=$2
@@ -1057,6 +1217,215 @@ refresh_serials_file() {
 	adb_device_serials >"$1"
 }
 
+# host из adb serial «IP:5555» / «host:port» для HTTP к планшету (USB serial — нет host)
+lunafast_serial_http_host() {
+	case "$1" in
+	*:*)
+		printf '%s\n' "${1%%:*}"
+		return 0
+		;;
+	esac
+	return 1
+}
+
+lunafast_healthcheck_url() {
+	_h=$1
+	printf 'http://%s:%s%s' "$_h" "${HEALTH_PORT:-8080}" "${HEALTH_PATH:-/healthcheck}"
+}
+
+# 0 — HTTP 2xx; 2 — нет curl/wget; 1 — иначе; при неуспехе в stdout строка-причина (stderr curl/wget или HTTP-код).
+lunafast_health_probe_explain() {
+	_url=$1
+	if command -v curl >/dev/null 2>&1; then
+		_ef=$(mktemp) || {
+			printf '%s\n' 'mktemp ошибка'
+			return 1
+		}
+		_code=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 10 "$_url" 2>"$_ef") || true
+		_ce=$(tr '\r\n' '  ' <"$_ef" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/  */ /g')
+		rm -f "$_ef"
+		case "$_code" in
+		2??) return 0 ;;
+		esac
+		if [ -n "$_code" ]; then
+			printf 'HTTP %s' "$_code"
+		fi
+		if [ -n "$_ce" ]; then
+			[ -n "$_code" ] && printf ' · '
+			printf '%s' "$_ce"
+		fi
+		if [ -z "$_code" ] && [ -z "$_ce" ]; then
+			printf '%s' 'curl: нет ответа'
+		fi
+		printf '\n'
+		return 1
+	fi
+	if command -v wget >/dev/null 2>&1; then
+		_ef=$(mktemp) || {
+			printf '%s\n' 'mktemp ошибка'
+			return 1
+		}
+		if wget -q -O /dev/null --timeout=10 "$_url" 2>"$_ef"; then
+			rm -f "$_ef"
+			return 0
+		fi
+		_we=$(tr '\r\n' '  ' <"$_ef" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/  */ /g')
+		rm -f "$_ef"
+		printf '%s\n' "${_we:-wget: не удалось выполнить запрос}"
+		return 1
+	fi
+	printf '%s\n' 'нет curl и wget на этой машине'
+	return 2
+}
+
+# Отчёт в файл $_f по всем device: serial TAB ОК|НЕ ОК TAB деталь
+lunafast_write_health_report_to() {
+	_f=$1
+	load_settings
+	ensure_adb
+	sf=$(mktemp) || return 1
+	: >"$_f" || {
+		rm -f "$sf"
+		return 1
+	}
+	refresh_serials_file "$sf"
+	_tp=0
+	{
+		printf '%s\n' "=== HTTP :${HEALTH_PORT}${HEALTH_PATH} — host из adb serial (часть до «:») ==="
+		printf '%s\n' ""
+	} >>"$_f"
+	if [ ! -s "$sf" ]; then
+		printf '%s\n' "(нет подключённых device)" >>"$_f"
+		rm -f "$sf"
+		return 0
+	fi
+	while read -r raw || [ -n "$raw" ]; do
+		_s=$(serial_clean "$raw")
+		[ -z "$_s" ] && continue
+		if ! _h=$(lunafast_serial_http_host "$_s"); then
+			printf '%s\tНЕ ОК\tнет сетевого host в serial (например USB)\n' "$_s" >>"$_f"
+			continue
+		fi
+		_url=$(lunafast_healthcheck_url "$_h")
+		_expl=$(lunafast_health_probe_explain "$_url")
+		_ec=$?
+		_expl=$(lunafast_trim "$_expl")
+		case "$_ec" in
+		0) printf '%s\tОК\t%s\n' "$_s" "$_url" >>"$_f" ;;
+		2)
+			printf '%s\tНЕ ОК\t%s\n' "$_s" "$_expl" >>"$_f"
+			_tp=1
+			;;
+		*) printf '%s\tНЕ ОК\t%s — %s\n' "$_s" "$_url" "$_expl" >>"$_f" ;;
+		esac
+	done <"$sf"
+	rm -f "$sf"
+	return "$_tp"
+}
+
+# PUT multipart: cryptopro container на одно устройство (пароль в журнал не пишется)
+lunafast_cryptopro_upload_one_to_log() {
+	_serial=$1
+	_cert_abs=$2
+	_pw=$3
+	_log=$4
+	if ! _host=$(lunafast_serial_http_host "$_serial"); then
+		{
+			printf '%s\n' "########################################"
+			printf '%s\n' "# serial: $_serial — КриптоПро контейнер"
+			printf '%s\n' "########################################"
+			printf '%s\n' "НЕ ОК · нет сетевого host в serial (например USB)"
+			printf '%s\n' ""
+		} >>"$_log"
+		return 1
+	fi
+	_url=$(printf 'http://%s:%s/cryptopro/upload/container' "$_host" "${HEALTH_PORT:-8080}")
+	_body=$(mktemp) || return 1
+	_cerr=$(mktemp) || {
+		rm -f "$_body"
+		return 1
+	}
+	{
+		printf '%s\n' "########################################"
+		printf '%s\n' "# serial: $_serial — PUT cryptopro/upload/container"
+		printf '%s\n' "# URL: $_url"
+		printf '%s\n' "# файл: $_cert_abs"
+		printf '%s\n' "# пароль: (не записывается в журнал)"
+		printf '%s\n' "########################################"
+	} >>"$_log"
+	_http=$(curl --location --silent --show-error --connect-timeout 5 --max-time 120 \
+		--request PUT "$_url" \
+		--form "container=@${_cert_abs}" \
+		--form "password=${_pw}" \
+		--write-out "%{http_code}" \
+		--output "$_body" 2>"$_cerr") || true
+	_ce=$?
+	printf '%s\n' "--- stderr curl ---" >>"$_log"
+	cat "$_cerr" >>"$_log" 2>/dev/null || true
+	printf '%s\n' "--- тело ответа ---" >>"$_log"
+	cat "$_body" >>"$_log" 2>/dev/null || true
+	printf '\n%s\n' "--- HTTP: ${_http:-?} · код выхода curl: $_ce ---" >>"$_log"
+	rm -f "$_body" "$_cerr"
+	_ok=0
+	case "${_http:-}" in
+	2??)
+		if [ "$_ce" -eq 0 ]; then
+			_ok=1
+		fi
+		;;
+	esac
+	if [ "$_ok" -eq 1 ]; then
+		printf '%s\n' "Итог: ОК" >>"$_log"
+	else
+		printf '%s\n' "Итог: НЕ ОК" >>"$_log"
+	fi
+	printf '%s\n' "" >>"$_log"
+	if [ "$_ok" -eq 1 ]; then return 0; fi
+	return 1
+}
+
+lunafast_cryptopro_upload_serials_logged() {
+	_serials=$1
+	_cert_abs=$2
+	_pw=$3
+	_log=$4
+	_err=0
+	while read -r raw || [ -n "$raw" ]; do
+		_s=$(serial_clean "$raw")
+		[ -z "$_s" ] && continue
+		lunafast_cryptopro_upload_one_to_log "$_s" "$_cert_abs" "$_pw" "$_log" || _err=1
+	done <"$_serials"
+	return "$_err"
+}
+
+lunafast_trim() {
+	printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+# Запуск приложения по package id на все serial из файла (по одному в строке)
+lunafast_launch_pkg_on_serials() {
+	_pkg=$1
+	_serf=$2
+	_out=$3
+	_any=1
+	_err=0
+	: >"$_out"
+	while read -r _s; do
+		[ -z "$_s" ] && continue
+		_any=0
+		{
+			printf '%s\n' "########################################"
+			printf '%s\n' "# am start MAIN/LAUNCHER: $_s → $_pkg"
+			printf '%s\n' "########################################"
+			lunafast_adb_linebuf -s "$_s" shell am start -a android.intent.action.MAIN \
+				-c android.intent.category.LAUNCHER -p "$_pkg" 2>&1 || _err=1
+			printf '%s\n' ""
+		} >>"$_out"
+	done <"$_serf"
+	[ "$_any" -eq 1 ] && return 1
+	return "$_err"
+}
+
 is_adb_target() {
 	case "$1" in
 	*:*:*) return 0 ;;
@@ -1173,12 +1542,14 @@ dialog_main() {
 		c=$(dialog --stdout --clear --colors \
 			--default-item "$mddef" \
 			--title "[ lunafast-fw-upload ] ─ Главное меню" \
-			--menu "Порт: $ADB_PORT  │  Подсеть: ${SCAN_SUBNET}.x\nЖурнал: lunafast_install.log (новые записи в начале файла) · п.5\n\n↑↓ выбор, Enter — открыть раздел." 23 80 7 \
+			--menu "Порт: $ADB_PORT  │  Подсеть: ${SCAN_SUBNET}.x  │  health: :${HEALTH_PORT}${HEALTH_PATH}\nЖурнал: lunafast_install.log (новые записи в начале файла) · п.5\n\n↑↓ выбор, Enter — открыть раздел." 26 82 10 \
 			1 "Сеть › поиск устройств (скан LAN)" \
 			2 "Прошивка › вложенное меню (цели, APK/XAPK…)" \
 			3 "Настройки" \
 			4 "Просмотр: adb devices -l" \
 			5 "Журнал установок (сверху — последняя операция)" \
+			6 "Перезагрузка: выбрать device (adb reboot)" \
+			7 "Health: GET :${HEALTH_PORT}${HEALTH_PATH} по IP из serial (ОК / НЕ ОК)" \
 			0 "Выход") || true
 		ex=$?
 		[ "$ex" -eq 255 ] || [ "$ex" -eq 1 ] && break
@@ -1193,6 +1564,8 @@ dialog_main() {
 			rm -f "$_tf"
 			;;
 		5) dialog_show_project_log ;;
+		6) dialog_reboot_device ;;
+		7) dialog_healthcheck_devices ;;
 		0) break ;;
 		esac
 	done
@@ -1227,12 +1600,14 @@ dialog_flash_menu() {
 	while true; do
 		b=$(dialog --stdout --clear \
 			--title "[ Прошивка ] ─ вложенное меню" \
-			--menu "Иерархия: Главная › Прошивка\n\nп.2 — только отметить устройства (Пробел в checklist)." 19 76 7 \
+			--menu "Иерархия: Главная › Прошивка\nп.2 — цели · п.6 — запуск приложения · п.7 — КриптоПро (certs/)." 22 76 10 \
 			1 "Подключить вручную: IP:PORT" \
 			2 "Выбор устройств для прошивки (checklist → сохранить)" \
 			3 "Установить APK / XAPK на сохранённый список (после п.2)" \
 			4 "Мастер: connect → APK → checklist → установка" \
 			5 "Показать сохранённые цели" \
+			6 "Запуск приложения на сохранённом списке (adb am start …)" \
+			7 "КриптоПро: загрузить контейнер (PUT …/cryptopro/upload/container)" \
 			0 "◀ Назад в главное меню") || break
 		case "$b" in
 		1) dialog_connect_ip ;;
@@ -1240,6 +1615,8 @@ dialog_flash_menu() {
 		3) dialog_install_saved ;;
 		4) dialog_install_wizard ;;
 		5) dialog_show_saved ;;
+		6) dialog_launch_app_saved ;;
+		7) dialog_cryptopro_upload_saved ;;
 		0) break ;;
 		esac
 	done
@@ -1296,7 +1673,7 @@ dialog_flash_checklist() {
 		dialog --msgbox "Ничего не отмечено." 5 40
 		return
 	fi
-	dialog --msgbox "Сохранено устройств: $nc\nДалее: п.3 — установка APK/XAPK на этот список." 8 65
+	dialog --msgbox "Сохранено устройств: $nc\nДалее: п.3 — APK/XAPK или п.7 — КриптоПро (certs/)." 8 72
 }
 
 dialog_show_saved() {
@@ -1315,6 +1692,64 @@ dialog_show_project_log() {
 		return
 	fi
 	dialog --title "[ журнал установок ]" --textbox "$lg" 32 94
+}
+
+dialog_reboot_device() {
+	load_settings
+	ensure_adb
+	sf=$(mktemp)
+	refresh_serials_file "$sf"
+	if [ ! -s "$sf" ]; then
+		dialog --msgbox "Нет устройств в состоянии device." 6 50
+		rm -f "$sf"
+		return
+	fi
+	n=$(wc -l <"$sf" | tr -d ' ')
+	lh=$n
+	[ "$lh" -gt 14 ] && lh=14
+	h=$((lh + 8))
+	args=""
+	i=1
+	while read -r ser; do
+		[ -z "$ser" ] && continue
+		args="$args $i $ser"
+		i=$((i + 1))
+	done <"$sf"
+	choice=$(dialog --stdout \
+		--title "[ перезагрузка ] adb reboot" \
+		--menu "Выберите устройство (↑↓, Enter). Отмена — Esc." "$h" 78 "$lh" $args) || {
+		rm -f "$sf"
+		return
+	}
+	ser=$(sed -n "${choice}p" "$sf")
+	rm -f "$sf"
+	[ -z "$ser" ] && return
+	dialog --yesno "Отправить «adb -s … reboot» на устройство?\n\n$ser" 9 72 || return
+	ec=0
+	out=$(mktemp)
+	adb -s "$ser" reboot >>"$out" 2>&1 || ec=$?
+	if [ "$ec" -eq 0 ]; then
+		dialog --msgbox "Команда отправлена.\n\n$ser\n\n(устройство должно перезагрузиться)" 10 72
+	else
+		dialog --title "[ ошибка adb reboot ]" --textbox "$out" 18 78
+	fi
+	rm -f "$out"
+}
+
+dialog_healthcheck_devices() {
+	load_settings
+	ensure_adb
+	rep=$(mktemp) || {
+		dialog --msgbox "Не удалось создать временный файл отчёта." 6 55
+		return 1
+	}
+	lunafast_write_health_report_to "$rep"
+	_hr=$?
+	dialog --title "[ health GET :${HEALTH_PORT}${HEALTH_PATH} ]" --cr-wrap --textbox "$rep" 22 94
+	rm -f "$rep"
+	if [ "$_hr" -ne 0 ]; then
+		dialog --msgbox "Замечание: на этой машине нет curl и wget для проверки HTTP (или сбой записи)." 10 72
+	fi
 }
 
 dialog_install_saved() {
@@ -1342,6 +1777,103 @@ dialog_install_saved() {
 	dialog --title "[ журнал · сверху последняя операция ]" --textbox "$proj" 28 92
 	if [ "$ret" -ne 0 ]; then
 		dialog --msgbox "Код возврата: $ret (есть ошибки).\n\nПолный журнал:\n$proj\n\nПросмотр: главное меню · п.5." 14 72
+	fi
+}
+
+dialog_launch_app_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.2 — выбор устройств (куда ставили apk)." 7 60
+		return
+	fi
+	load_settings
+	ensure_adb
+	src=$(dialog --stdout \
+		--title "[ Прошивка › запуск приложения ]" \
+		--menu "Способ указать приложение (↑↓, Enter):" 12 72 3 \
+		1 "Ввести package id (по умолчанию из Настроек при необходимости)" \
+		2 "Взять id из локального APK (aapt/aapt2)" \
+		0 "Отмена") || return
+	case "$src" in
+	0 | "") return ;;
+	1)
+		raw=$(dialog --stdout --title "[ package id ]" \
+			--inputbox "Имя пакета для am start -p … (MAIN+LAUNCHER):" 11 76 "$LAUNCH_PACKAGE") || return
+		pkg=$(lunafast_trim "$raw")
+		;;
+	2)
+		ap=$(dialog_pick_install_package "[ APK для определения пакета ]") || return
+		if is_xapk_path "$ap"; then
+			dialog --msgbox "Для XAPK укажите package id вручную (п.1) или в настройках." 8 60
+			return
+		fi
+		pkg=$(detect_pkg_from_apk "$ap")
+		pkg=$(lunafast_trim "$pkg")
+		if [ -z "$pkg" ]; then
+			dialog --msgbox "Не удалось прочесть package id (нужны aapt или aapt2 в PATH)." 8 72
+			return
+		fi
+		;;
+	*) return ;;
+	esac
+	if [ -z "$pkg" ]; then
+		dialog --msgbox "Пустое имя пакета." 5 42
+		return
+	fi
+	dialog --yesno "Запустить на всех сохранённых устройствах?\n\nam start … -p \"$pkg\"\n\n(MAIN + LAUNCHER)" 11 74 || return
+	tmp=$(mktemp)
+	lunafast_launch_pkg_on_serials "$pkg" "$f" "$tmp"
+	ex=$?
+	if [ "$ex" -eq 0 ]; then
+		dialog --msgbox "Команды отправлены.\nПакет: $pkg" 9 72
+	elif [ -s "$tmp" ]; then
+		dialog --title "[ запуск: вывод adb ]" --textbox "$tmp" 22 82
+	else
+		dialog --msgbox "Ошибка запуска (нет вывода).\nКод: $ex" 7 50
+	fi
+	rm -f "$tmp"
+}
+
+dialog_cryptopro_upload_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.2 — выбор устройств." 7 55
+		return
+	fi
+	command -v curl >/dev/null 2>&1 || {
+		dialog --msgbox "Нужен curl в PATH (PUT multipart)." 6 50
+		return 1
+	}
+	load_settings
+	cf=$(dialog_pick_cert_container "[ Прошивка › КриптоПро контейнер ]") || return
+	cf=$(lunafast_trim "$cf")
+	if [ ! -r "$cf" ]; then
+		dialog --msgbox "Файл недоступен для чтения: $cf" 8 72
+		return 1
+	fi
+	pw_raw=$(dialog --stdout --clear --colors --title "[ Прошивка › КриптоПро ]" \
+		--passwordbox "Пароль контейнера (не сохраняется, не журналируется):\nМожно оставить пустым если не нужен." 12 74 "") || return
+	password=$(lunafast_trim "$pw_raw")
+	_nd=$(wc -l <"$f" | tr -d ' ')
+	dialog --yesno "Отправить «$(basename "$cf")» на $_nd устройство(в)?\n\nPUT …/cryptopro/upload/container · порт HTTP ${HEALTH_PORT}\n(form: container=@файл, password=…)" 13 72 || return
+	rep=$(mktemp) || {
+		dialog --msgbox "Не удалось создать временный файл журнала." 6 60
+		return 1
+	}
+	if ! lunafast_begin_log_section "$rep" "КриптоПро: PUT container · $(basename "$cf")"; then
+		rm -f "$rep"
+		dialog --msgbox "Не удалось записать журнал (сессия)." 8 72
+		return 1
+	fi
+	lunafast_cryptopro_upload_serials_logged "$f" "$cf" "$password" "$rep"
+	ret=$?
+	lunafast_end_log_section "$rep" "$ret"
+	lunafast_prepend_session_to_project_log "$rep" || true
+	proj=$(lunafast_project_log_path)
+	dialog --title "[ журнал · КриптоПро загрузка ]" --cr-wrap --textbox "$proj" 30 94
+	rm -f "$rep"
+	if [ "$ret" -ne 0 ]; then
+		dialog --msgbox "Есть ошибки (код $ret).\n\nЖурнал: $proj · главное меню п.5" 12 72
 	fi
 }
 
@@ -1420,10 +1952,19 @@ dialog_settings() {
 	[ -n "$p" ] && ADB_PORT=$p
 	s=$(dialog --stdout --inputbox "Подсеть (3 октета):" 8 60 "$SCAN_SUBNET") || return
 	[ -n "$s" ] && SCAN_SUBNET=$s
+	lp=$(dialog --stdout --title "[ пакет для п.6 Прошивка ]" \
+		--inputbox "Имя пакета для «Запуск приложения» [пусто — каждый раз вручную]:" 11 70 "$LAUNCH_PACKAGE") || return
+	LAUNCH_PACKAGE=$(lunafast_trim "$lp")
+	hp=$(dialog --stdout --title "[ HTTP health главное меню › п.7 ]" \
+		--inputbox "Порт HTTP API на устройстве (например 8080):" 9 60 "$HEALTH_PORT") || return
+	[ -n "$hp" ] && HEALTH_PORT=$hp
+	hp_path=$(dialog --stdout --title "[ HTTP health путь ]" \
+		--inputbox "Путь URI (начиная с /), например /healthcheck:" 9 76 "$HEALTH_PATH") || return
+	[ -n "$hp_path" ] && HEALTH_PATH=$hp_path
 	save_settings
 	LUNAFAST_MENU_DEFAULT_ITEM=3
 	export LUNAFAST_MENU_DEFAULT_ITEM
-	dialog --msgbox "Сохранено в $(settings_file)\n\nСкан подсети не запускается.\nПоиск в LAN — отдельно, пункт «Сеть › поиск…» в меню." 10 62
+	dialog --msgbox "Сохранено в $(settings_file)\n\nСкан подсети не запускается.\nПоиск в LAN — отдельно, пункт «Сеть › поиск…».\nLAUNCH_PACKAGE — п.6 Прошивка.\nHEALTH_PORT — главное меню п.7 (GET health) и Прошивка п.7 (PUT КриптоПро).\nHEALTH_PATH — только для GET health." 17 68
 }
 
 # ═══════════════ текст: псевдографика ═══════════════
@@ -1471,9 +2012,11 @@ text_flash_menu_txt() {
 		printf '│  3) Установить APK/XAPK на сохранённый список            │\n'
 		printf '│  4) Мастер (connect → пакет → номера)                    │\n'
 		printf '│  5) Показать сохранённые serial                          │\n'
+		printf '│  6) Запуск приложения на сохранённом списке               │\n'
+		printf '│  7) КриптоПро: PUT контейнер (certs/ → сохранённые serial)   │\n'
 		printf '│  0) ◀ Назад                                              │\n'
 		text_hline_bot 58
-		printf '%s' "Выбор [0-5]: "
+		printf '%s' "Выбор [0-7]: "
 		read -r b || return
 		case "$b" in
 		1)
@@ -1489,9 +2032,168 @@ text_flash_menu_txt() {
 			if [ -s "$f" ]; then cat "$f"; else printf '%s\n' "(пусто)"; fi
 			read -r _
 			;;
+		6) text_launch_saved_txt ;;
+		7) text_cryptopro_upload_txt ;;
 		0) break ;;
 		esac
 	done
+}
+
+text_cryptopro_upload_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.2 — список устройств."
+		read -r _
+		return
+	fi
+	command -v curl >/dev/null 2>&1 || {
+		printf '%s\n' "Нужен curl в PATH."
+		read -r _
+		return 1
+	}
+	load_settings
+	cand=$(collect_cert_candidates)
+	if [ -n "$cand" ]; then
+		printf '%s\n' "--- архивы/файлы в certs/ ---"
+		printf '%s\n' "$cand"
+		printf '%s\n' "----------------------------"
+	fi
+	printf '%s' "Путь к контейнеру [certs/…]: "
+	read -r path || return
+	[ -z "$path" ] && return
+	cf=$(resolve_cert_container_path "$path") || {
+		printf '%s\n' "Нет файла: $path"
+		read -r _
+		return
+	}
+	if [ ! -r "$cf" ]; then
+		printf '%s\n' "Файл не читается: $cf"
+		read -r _
+		return
+	fi
+	_ts=
+	if lunafast_term_tty; then
+		_ts=$(stty -g 2>/dev/null)
+	fi
+	printf '%s' "Пароль контейнера (Enter = пусто; скрытый ввод если TTY): "
+	if [ -n "$_ts" ]; then stty -echo 2>/dev/null; fi
+	read -r password || true
+	if [ -n "$_ts" ]; then stty "$_ts" 2>/dev/null; fi
+	printf '\n'
+	password=$(lunafast_trim "$password")
+	printf '%s\n' "Отправить «$(basename "$cf")» на устройства ниже? [y/N]"
+	cat "$f"
+	read -r yn || return
+	case "$yn" in
+	y | Y | yes | YES | д | Д) ;;
+	*)
+		printf '%s\n' "Отменено."
+		read -r _
+		return
+		;;
+	esac
+	lg=$(mktemp) || {
+		printf '%s\n' "Не удалось создать журнал."
+		read -r _
+		return 1
+	}
+	lunafast_begin_log_section "$lg" "КриптоПро: PUT container · $(basename "$cf")" || {
+		rm -f "$lg"
+		printf '%s\n' "Не удалось начать сессию журнала."
+		read -r _
+		return 1
+	}
+	lunafast_cryptopro_upload_serials_logged "$f" "$cf" "$password" "$lg"
+	ret=$?
+	lunafast_end_log_section "$lg" "$ret"
+	lunafast_prepend_session_to_project_log "$lg" || true
+	proj=$(lunafast_project_log_path)
+	printf '%s\n' "--- журнал $proj (сверху — эта операция), код $ret ---"
+	head -n 120 "$proj"
+	printf '%s\n' "--- Enter ---"
+	read -r _
+	rm -f "$lg"
+}
+
+text_launch_saved_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.2 — список устройств для прошивки."
+		read -r _
+		return
+	fi
+	load_settings
+	ensure_adb
+	printf '%s\n' "Как задать приложение: 1 — ввести id  2 — из APK (aapt)"
+	printf '%s' "? "
+	read -r src || return
+	pkg=
+	case "$src" in
+	1)
+		printf '%s' "Package id [${LAUNCH_PACKAGE}]: "
+		read -r pkg || return
+		[ -z "$pkg" ] && pkg=$LAUNCH_PACKAGE
+		;;
+	2)
+		cand=$(collect_install_candidates)
+		if [ -n "$cand" ]; then
+			printf '%s\n' "$cand"
+			printf '%s\n' "---"
+		fi
+		printf '%s' "Путь к APK: "
+		read -r path || return
+		[ -z "$path" ] && return
+		ap=$(resolve_installable_path "$path") || {
+			printf '%s\n' "Нет файла: $path"
+			read -r _
+			return
+		}
+		if is_xapk_path "$ap"; then
+			printf '%s\n' "Для XAPK укажите package вручную (п.1)."
+			read -r _
+			return
+		fi
+		pkg=$(detect_pkg_from_apk "$ap")
+		pkg=$(lunafast_trim "$pkg")
+		if [ -z "$pkg" ]; then
+			printf '%s\n' "Не удалось прочесть id (нужны aapt/aapt2)."
+			read -r _
+			return
+		fi
+		printf '%s\n' "Определённый пакет: $pkg"
+		;;
+	*)
+		printf '%s\n' "Отмена."
+		return
+		;;
+	esac
+	pkg=$(lunafast_trim "$pkg")
+	if [ -z "$pkg" ]; then
+		printf '%s\n' "Пустой пакет."
+		read -r _
+		return
+	fi
+	printf '%s\n' "--- цели ---"
+	cat "$f"
+	printf '%s\n' "Запустить \"$pkg\" на этих устройствах? [y/N]"
+	read -r yn || return
+	case "$yn" in
+	y | Y | yes | YES | д | Д) ;;
+	*)
+		printf '%s\n' "Отменено."
+		read -r _
+		return
+		;;
+	esac
+	tmp=$(mktemp)
+	if lunafast_launch_pkg_on_serials "$pkg" "$f" "$tmp"; then
+		printf '%s\n' "Готово. Пакет: $pkg"
+	else
+		printf '%s\n' "Были ошибки или adb отказал:"
+		cat "$tmp"
+	fi
+	rm -f "$tmp"
+	read -r _
 }
 
 text_flash_checklist_txt() {
@@ -1521,7 +2223,7 @@ text_flash_checklist_txt() {
 	fi
 	mv "$p" "$out"
 	rm -f "$sf"
-	printf '%s\n' "Сохранено в $out"
+	printf '%s\n' "Сохранено в $out — далее п.3 (APK) или п.7 (КриптоПро)."
 	read -r _
 }
 
@@ -1652,8 +2354,34 @@ menu_settings_text() {
 	printf '%s' "Подсеть [ $SCAN_SUBNET ]: "
 	read -r s
 	[ -n "$s" ] && SCAN_SUBNET=$s
+	printf '%s' "Пакет для п.6 запуск [${LAUNCH_PACKAGE:-—}] (Enter = не менять): "
+	read -r lp || true
+	[ -n "$lp" ] && LAUNCH_PACKAGE=$lp
+	printf '%s' "Health HTTP-порт [:${HEALTH_PORT}] (Enter = не менять): "
+	read -r hh || true
+	[ -n "$hh" ] && HEALTH_PORT=$hh
+	printf '%s' "Health URI-путь [$HEALTH_PATH] (Enter = не менять): "
+	read -r hp || true
+	[ -n "$hp" ] && HEALTH_PATH=$hp
 	save_settings
 	printf '%s\n' "Сохранено: $(settings_file)"
+	read -r _
+}
+
+text_healthcheck_devices_txt() {
+	load_settings
+	ensure_adb
+	rep=$(mktemp) || {
+		printf '%s\n' "Не удалось создать временный файл отчёта."
+		read -r _
+		return 1
+	}
+	lunafast_write_health_report_to "$rep"
+	_h=$?
+	printf '%s\n' "--- Отчёт (serial / статус / URL или причина) ---"
+	cat "$rep"
+	rm -f "$rep"
+	[ "$_h" -ne 0 ] && printf '%s\n' "--- Замечание: нет curl и wget или ошибка записи ---"
 	read -r _
 }
 
@@ -1688,10 +2416,12 @@ text_main() {
 		printf '│  3) Настройки                                          │\n'
 		printf '│  4) adb devices -l                                     │\n'
 		printf '│  5) Журнал установок (lunafast_install.log)             │\n'
+		printf '│  6) Перезагрузка device (adb reboot)                      │\n'
+		printf '│  7) Health: GET по настройке (:${HEALTH_PORT}${HEALTH_PATH}) — ОК/НЕ ОК     │\n'
 		printf '│  0) Выход                                              │\n'
 		text_hline_bot 58
 		adb devices -l
-		printf '%s' "[0-5]: "
+		printf '%s' "[0-7]: "
 		read -r c || exit 0
 		case "$c" in
 		1) text_search_flow ;;
@@ -1715,9 +2445,68 @@ text_main() {
 			fi
 			read -r _
 			;;
+		6) text_reboot_device_txt ;;
+		7) text_healthcheck_devices_txt ;;
 		0) exit 0 ;;
 		esac
 	done
+}
+
+text_reboot_device_txt() {
+	load_settings
+	ensure_adb
+	sf=$(mktemp)
+	refresh_serials_file "$sf"
+	if [ ! -s "$sf" ]; then
+		printf '%s\n' "Нет устройств в состоянии device."
+		rm -f "$sf"
+		read -r _
+		return
+	fi
+	n=$(wc -l <"$sf" | tr -d ' ')
+	printf '%s\n' "--- adb devices -l ---"
+	adb devices -l
+	printf '%s\n' "--- выберите номер для adb reboot ---"
+	print_numbered_txt "$sf"
+	printf '%s' "Номер [1-$n]: "
+	read -r num || {
+		rm -f "$sf"
+		return
+	}
+	case "$num" in *[!0-9]*)
+		printf '%s\n' "Нужен номер строки."
+		rm -f "$sf"
+		read -r _
+		return
+		;;
+	esac
+	[ -z "$num" ] && {
+		rm -f "$sf"
+		return
+	}
+	[ "$num" -ge 1 ] && [ "$num" -le "$n" ] || {
+		printf '%s\n' "Номер вне диапазона."
+		rm -f "$sf"
+		read -r _
+		return
+	}
+	ser=$(sed -n "${num}p" "$sf")
+	rm -f "$sf"
+	printf 'Перезагрузить «%s»? [y/N]: ' "$ser"
+	read -r yn || return
+	case "$yn" in
+	y | Y | yes | YES | д | Д)
+		if adb -s "$ser" reboot; then
+			printf '%s\n' "Команда отправлена (устройство должно перезагрузиться)."
+		else
+			printf '%s\n' "Ошибка adb reboot (см. выше)."
+		fi
+		;;
+	*)
+		printf '%s\n' "Отменено."
+		;;
+	esac
+	read -r _
 }
 
 install_apk_batch() {
