@@ -9,5 +9,9 @@ apks/*
 certs/*
 !certs/.gitkeep
 
+# Заставки (кладите локально; не коммитить)
+screensaver/*
+!screensaver/.gitkeep
+
 __pycache__/
 *.py[cod]

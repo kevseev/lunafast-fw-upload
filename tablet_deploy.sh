@@ -164,6 +164,8 @@ usage() {
 
   КриптоПро: Прошивка п.7 — PUT http://<IP>:HEALTH_PORT/cryptopro/upload/container (curl -F container=@файл из certs/ -F password=…), список устройств как для APK (п.2).
 
+  Заставка: Прошивка п.8 — файлы из screensaver/ → POST http://<IP>:HEALTH_PORT/screensaver (curl -F file=@файл), те же сохранённые serial (п.2), что и для APK; нужен curl; serial вида IP:PORT (не USB без сетевого host).
+
   Health: главное меню п.7 — GET http://<host из serial>:HEALTH_PORT+HEALTH_PATH (по умолчанию :8080/healthcheck), колонки ОК/НЕ ОК; нужны curl или wget на ПК.
 
   UI без dialog: текстовые рамки. apt install dialog (Debian/Ubuntu).
@@ -860,6 +862,108 @@ resolve_cert_container_path() {
 	return 1
 }
 
+# Файлы заставки в screensaver/ (рядом со скриптом)
+screensaver_project_dir() {
+	printf '%s/screensaver\n' "$(lunafast_project_root)"
+}
+
+collect_screensaver_candidates() {
+	_sd=$(screensaver_project_dir)
+	{
+		if [ -d "$_sd" ]; then
+			find "$_sd" -maxdepth 8 -type f 2>/dev/null
+		fi
+	} | while read -r L; do
+		[ -z "$L" ] && continue
+		norm=$(apk_abspath "$L" 2>/dev/null) || norm=$L
+		printf '%s\n' "$norm"
+	done | sort -u
+}
+
+resolve_screensaver_path() {
+	raw=$1
+	[ -z "$raw" ] && return 1
+	_sd=$(screensaver_project_dir)
+	for c in "$raw" "$_sd/$raw"; do
+		if [ -f "$c" ]; then
+			apk_abspath "$c"
+			return $?
+		fi
+	done
+	return 1
+}
+
+# POST multipart: файл заставки на одно устройство (поле form: file)
+lunafast_screensaver_upload_one_to_log() {
+	_serial=$1
+	_file_abs=$2
+	_log=$3
+	if ! _host=$(lunafast_serial_http_host "$_serial"); then
+		{
+			printf '%s\n' "########################################"
+			printf '%s\n' "# serial: $_serial — заставка POST …/screensaver"
+			printf '%s\n' "########################################"
+			printf '%s\n' "НЕ ОК · нет сетевого host в serial (например USB)"
+			printf '%s\n' ""
+		} >>"$_log"
+		return 1
+	fi
+	_url=$(printf 'http://%s:%s/screensaver' "$_host" "${HEALTH_PORT:-8080}")
+	_body=$(mktemp) || return 1
+	_cerr=$(mktemp) || {
+		rm -f "$_body"
+		return 1
+	}
+	{
+		printf '%s\n' "########################################"
+		printf '%s\n' "# serial: $_serial — POST …/screensaver"
+		printf '%s\n' "# URL: $_url"
+		printf '%s\n' "# файл: $_file_abs"
+		printf '%s\n' "########################################"
+	} >>"$_log"
+	_http=$(curl --location --silent --show-error --connect-timeout 5 --max-time 120 \
+		--request POST "$_url" \
+		--form "file=@${_file_abs}" \
+		--write-out "%{http_code}" \
+		--output "$_body" 2>"$_cerr") || true
+	_ce=$?
+	printf '%s\n' "--- stderr curl ---" >>"$_log"
+	cat "$_cerr" >>"$_log" 2>/dev/null || true
+	printf '%s\n' "--- тело ответа ---" >>"$_log"
+	cat "$_body" >>"$_log" 2>/dev/null || true
+	printf '\n%s\n' "--- HTTP: ${_http:-?} · код выхода curl: $_ce ---" >>"$_log"
+	rm -f "$_body" "$_cerr"
+	_ok=0
+	case "${_http:-}" in
+	2??)
+		if [ "$_ce" -eq 0 ]; then
+			_ok=1
+		fi
+		;;
+	esac
+	if [ "$_ok" -eq 1 ]; then
+		printf '%s\n' "Итог: ОК" >>"$_log"
+	else
+		printf '%s\n' "Итог: НЕ ОК" >>"$_log"
+	fi
+	printf '%s\n' "" >>"$_log"
+	if [ "$_ok" -eq 1 ]; then return 0; fi
+	return 1
+}
+
+lunafast_screensaver_upload_serials_logged() {
+	_serf=$1
+	_file_abs=$2
+	_log=$3
+	_err=0
+	while read -r raw || [ -n "$raw" ]; do
+		_s=$(serial_clean "$raw")
+		[ -z "$_s" ] && continue
+		lunafast_screensaver_upload_one_to_log "$_s" "$_file_abs" "$_log" || _err=1
+	done <"$_serf"
+	return "$_err"
+}
+
 # Расширенная тема dialog: классические серо-белые окна (как типичный новодialog)
 lunafast_write_dialogrc() {
 	d=$(state_dir)
@@ -1009,6 +1113,63 @@ dialog_pick_cert_container() {
 			--inputbox "Полный путь или имя в certs/:" 11 74 "") || return 1
 		[ -z "$res" ] && return 1
 		ap=$(resolve_cert_container_path "$res") || {
+			dialog --msgbox "Файл не найден: $res" 6 50
+			return 1
+		}
+		printf '%s\n' "$ap"
+		return 0
+	fi
+	sel=$(sed -n "${tag}p" "$pf")
+	rm -f "$pf"
+	case "$tag" in *[!0-9]*) return 1 ;; esac
+	[ "$tag" -lt 1 ] 2>/dev/null || [ "$tag" -gt "$n" ] 2>/dev/null && return 1
+	[ -z "$sel" ] && return 1
+	printf '%s\n' "$sel"
+}
+
+# Выбор файла заставки в screensaver/ + ручной путь
+dialog_pick_screensaver_file() {
+	title=$1
+	pf=$(mktemp) || return 1
+	collect_screensaver_candidates >"$pf" || true
+	if [ ! -s "$pf" ]; then
+		rm -f "$pf"
+		res=$(dialog --stdout --clear --colors --title "$title" \
+			--inputbox "Путь к файлу заставки (в screensaver/ ничего не найдено):" 12 74 "") || return 1
+		[ -z "$res" ] && return 1
+		ap=$(resolve_screensaver_path "$res") || {
+			dialog --msgbox "Файл не найден: $res" 6 50
+			return 1
+		}
+		printf '%s\n' "$ap"
+		return 0
+	fi
+	n=$(wc -l <"$pf" | tr -d ' ')
+	manual=$((n + 1))
+	mh=$n
+	[ "$mh" -gt 14 ] && mh=14
+	tot=$((mh + 9))
+	[ "$tot" -gt 26 ] && tot=26
+	i=1
+	set --
+	while read -r pth; do
+		[ -z "$pth" ] && continue
+		set -- "$@" "$i" "$(basename "$pth")"
+		i=$((i + 1))
+	done <"$pf"
+	set -- "$@" "$manual" "Другой путь…"
+	tag=$(dialog --stdout --clear --colors --title "$title" \
+		--menu "Каталог screensaver/ (↑↓, Enter). Пробел не нужен." "$tot" 80 "$mh" "$@") || {
+		rm -f "$pf"
+		return 1
+	}
+	tag=$(printf '%s' "$tag" | tr -d '\r\n')
+	if [ "$tag" -eq "$manual" ] 2>/dev/null; then
+		rm -f "$pf"
+		res=$(dialog --stdout --clear --colors --title "$title" \
+			--inputbox "Полный путь или имя в screensaver/:" 11 74 "") || return 1
+		[ -z "$res" ] && return 1
+		ap=$(resolve_screensaver_path "$res") || {
 			dialog --msgbox "Файл не найден: $res" 6 50
 			return 1
 		}
@@ -1597,10 +1758,10 @@ dialog_search_flow() {
 }
 
 dialog_flash_menu() {
-	while true; do
+		while true; do
 		b=$(dialog --stdout --clear \
 			--title "[ Прошивка ] ─ вложенное меню" \
-			--menu "Иерархия: Главная › Прошивка\nп.2 — цели · п.6 — запуск приложения · п.7 — КриптоПро (certs/)." 22 76 10 \
+			--menu "Иерархия: Главная › Прошивка\nп.2 — цели · п.6 — запуск приложения · п.7 — КриптоПро (certs/) · п.8 — заставка (screensaver/)." 24 76 11 \
 			1 "Подключить вручную: IP:PORT" \
 			2 "Выбор устройств для прошивки (checklist → сохранить)" \
 			3 "Установить APK / XAPK на сохранённый список (после п.2)" \
@@ -1608,6 +1769,7 @@ dialog_flash_menu() {
 			5 "Показать сохранённые цели" \
 			6 "Запуск приложения на сохранённом списке (adb am start …)" \
 			7 "КриптоПро: загрузить контейнер (PUT …/cryptopro/upload/container)" \
+			8 "Заставка: отправить файл из screensaver/ (POST …/screensaver)" \
 			0 "◀ Назад в главное меню") || break
 		case "$b" in
 		1) dialog_connect_ip ;;
@@ -1617,6 +1779,7 @@ dialog_flash_menu() {
 		5) dialog_show_saved ;;
 		6) dialog_launch_app_saved ;;
 		7) dialog_cryptopro_upload_saved ;;
+		8) dialog_screensaver_upload_saved ;;
 		0) break ;;
 		esac
 	done
@@ -1673,7 +1836,7 @@ dialog_flash_checklist() {
 		dialog --msgbox "Ничего не отмечено." 5 40
 		return
 	fi
-	dialog --msgbox "Сохранено устройств: $nc\nДалее: п.3 — APK/XAPK или п.7 — КриптоПро (certs/)." 8 72
+	dialog --msgbox "Сохранено устройств: $nc\nДалее: п.3 — APK/XAPK, п.7 — КриптоПро (certs/), п.8 — заставка (screensaver/)." 9 72
 }
 
 dialog_show_saved() {
@@ -1877,6 +2040,46 @@ dialog_cryptopro_upload_saved() {
 	fi
 }
 
+dialog_screensaver_upload_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.2 — выбор устройств." 7 55
+		return
+	fi
+	command -v curl >/dev/null 2>&1 || {
+		dialog --msgbox "Нужен curl в PATH (POST multipart)." 6 50
+		return 1
+	}
+	load_settings
+	sf=$(dialog_pick_screensaver_file "[ Прошивка › заставка screensaver/ ]") || return
+	sf=$(lunafast_trim "$sf")
+	if [ ! -r "$sf" ]; then
+		dialog --msgbox "Файл недоступен для чтения: $sf" 8 72
+		return 1
+	fi
+	_nd=$(wc -l <"$f" | tr -d ' ')
+	dialog --yesno "Отправить «$(basename "$sf")» на $_nd устройство(в)?\n\nPOST …/screensaver · порт HTTP ${HEALTH_PORT}\n(form: file=@файл)\n\nНужен serial вида IP:PORT (сеть); по USB host для HTTP нет." 14 72 || return
+	rep=$(mktemp) || {
+		dialog --msgbox "Не удалось создать временный файл журнала." 6 60
+		return 1
+	}
+	if ! lunafast_begin_log_section "$rep" "Заставка: POST screensaver · $(basename "$sf") · $sf"; then
+		rm -f "$rep"
+		dialog --msgbox "Не удалось записать журнал (сессия)." 8 72
+		return 1
+	fi
+	lunafast_screensaver_upload_serials_logged "$f" "$sf" "$rep"
+	ret=$?
+	lunafast_end_log_section "$rep" "$ret"
+	lunafast_prepend_session_to_project_log "$rep" || true
+	proj=$(lunafast_project_log_path)
+	dialog --title "[ журнал · заставка screensaver ]" --cr-wrap --textbox "$proj" 30 94
+	rm -f "$rep"
+	if [ "$ret" -ne 0 ]; then
+		dialog --msgbox "Есть ошибки (код $ret).\n\nЖурнал: $proj · главное меню п.5" 12 72
+	fi
+}
+
 dialog_install_wizard() {
 	load_settings
 	ensure_adb
@@ -1964,7 +2167,7 @@ dialog_settings() {
 	save_settings
 	LUNAFAST_MENU_DEFAULT_ITEM=3
 	export LUNAFAST_MENU_DEFAULT_ITEM
-	dialog --msgbox "Сохранено в $(settings_file)\n\nСкан подсети не запускается.\nПоиск в LAN — отдельно, пункт «Сеть › поиск…».\nLAUNCH_PACKAGE — п.6 Прошивка.\nHEALTH_PORT — главное меню п.7 (GET health) и Прошивка п.7 (PUT КриптоПро).\nHEALTH_PATH — только для GET health." 17 68
+	dialog --msgbox "Сохранено в $(settings_file)\n\nСкан подсети не запускается.\nПоиск в LAN — отдельно, пункт «Сеть › поиск…».\nLAUNCH_PACKAGE — п.6 Прошивка.\nHEALTH_PORT — главное меню п.7 (GET health), Прошивка п.7 (PUT КриптоПро) и п.8 (POST заставка).\nHEALTH_PATH — только для GET health." 17 68
 }
 
 # ═══════════════ текст: псевдографика ═══════════════
@@ -2014,9 +2217,10 @@ text_flash_menu_txt() {
 		printf '│  5) Показать сохранённые serial                          │\n'
 		printf '│  6) Запуск приложения на сохранённом списке               │\n'
 		printf '│  7) КриптоПро: PUT контейнер (certs/ → сохранённые serial)   │\n'
+		printf '│  8) Заставка: POST из screensaver/ → HTTP …/screensaver   │\n'
 		printf '│  0) ◀ Назад                                              │\n'
 		text_hline_bot 58
-		printf '%s' "Выбор [0-7]: "
+		printf '%s' "Выбор [0-8]: "
 		read -r b || return
 		case "$b" in
 		1)
@@ -2034,6 +2238,7 @@ text_flash_menu_txt() {
 			;;
 		6) text_launch_saved_txt ;;
 		7) text_cryptopro_upload_txt ;;
+		8) text_screensaver_upload_txt ;;
 		0) break ;;
 		esac
 	done
@@ -2104,6 +2309,74 @@ text_cryptopro_upload_txt() {
 		return 1
 	}
 	lunafast_cryptopro_upload_serials_logged "$f" "$cf" "$password" "$lg"
+	ret=$?
+	lunafast_end_log_section "$lg" "$ret"
+	lunafast_prepend_session_to_project_log "$lg" || true
+	proj=$(lunafast_project_log_path)
+	printf '%s\n' "--- журнал $proj (сверху — эта операция), код $ret ---"
+	head -n 120 "$proj"
+	printf '%s\n' "--- Enter ---"
+	read -r _
+	rm -f "$lg"
+}
+
+text_screensaver_upload_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.2 — список устройств."
+		read -r _
+		return
+	fi
+	command -v curl >/dev/null 2>&1 || {
+		printf '%s\n' "Нужен curl в PATH."
+		read -r _
+		return 1
+	}
+	load_settings
+	cand=$(collect_screensaver_candidates)
+	if [ -n "$cand" ]; then
+		printf '%s\n' "--- файлы в screensaver/ ---"
+		printf '%s\n' "$cand"
+		printf '%s\n' "----------------------------"
+	fi
+	printf '%s' "Путь к файлу заставки [screensaver/…]: "
+	read -r path || return
+	[ -z "$path" ] && return
+	sf=$(resolve_screensaver_path "$path") || {
+		printf '%s\n' "Нет файла: $path"
+		read -r _
+		return
+	}
+	if [ ! -r "$sf" ]; then
+		printf '%s\n' "Файл не читается: $sf"
+		read -r _
+		return
+	fi
+	printf '%s\n' "HTTP POST …/screensaver · порт ${HEALTH_PORT:-8080} · form: file=@файл"
+	printf '%s\n' "Serial должны быть вида IP:PORT (иначе нет host для HTTP)."
+	printf '%s\n' "Отправить «$(basename "$sf")» на устройства ниже? [y/N]"
+	cat "$f"
+	read -r yn || return
+	case "$yn" in
+	y | Y | yes | YES | д | Д) ;;
+	*)
+		printf '%s\n' "Отменено."
+		read -r _
+		return
+		;;
+	esac
+	lg=$(mktemp) || {
+		printf '%s\n' "Не удалось создать журнал."
+		read -r _
+		return 1
+	}
+	lunafast_begin_log_section "$lg" "Заставка: POST screensaver · $(basename "$sf") · $sf" || {
+		rm -f "$lg"
+		printf '%s\n' "Не удалось начать сессию журнала."
+		read -r _
+		return 1
+	}
+	lunafast_screensaver_upload_serials_logged "$f" "$sf" "$lg"
 	ret=$?
 	lunafast_end_log_section "$lg" "$ret"
 	lunafast_prepend_session_to_project_log "$lg" || true
@@ -2223,7 +2496,7 @@ text_flash_checklist_txt() {
 	fi
 	mv "$p" "$out"
 	rm -f "$sf"
-	printf '%s\n' "Сохранено в $out — далее п.3 (APK) или п.7 (КриптоПро)."
+	printf '%s\n' "Сохранено в $out — далее п.3 (APK), п.7 (КриптоПро) или п.8 (заставка screensaver/)."
 	read -r _
 }
 
