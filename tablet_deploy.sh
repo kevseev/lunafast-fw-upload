@@ -1758,7 +1758,7 @@ dialog_search_flow() {
 }
 
 dialog_flash_menu() {
-		while true; do
+	while true; do
 		b=$(dialog --stdout --clear \
 			--title "[ Прошивка ] ─ вложенное меню" \
 			--menu "Иерархия: Главная › Прошивка\nп.2 — цели · п.6 — запуск приложения · п.7 — КриптоПро (certs/) · п.8 — заставка (screensaver/)." 24 76 11 \
