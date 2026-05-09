@@ -9,6 +9,10 @@ set_defaults() {
 	LAUNCH_PACKAGE=
 	HEALTH_PORT=8080
 	HEALTH_PATH=/healthcheck
+	CLICK_X1=5
+	CLICK_Y1=1055
+	CLICK_X2=795
+	CLICK_Y2=1275
 }
 
 DEFAULT_HOST1=192.168.1.211
@@ -47,6 +51,10 @@ load_settings() {
 	: "${LAUNCH_PACKAGE:=}"
 	: "${HEALTH_PORT:=8080}"
 	: "${HEALTH_PATH:=/healthcheck}"
+	: "${CLICK_X1:=5}"
+	: "${CLICK_Y1:=1055}"
+	: "${CLICK_X2:=795}"
+	: "${CLICK_Y2:=1275}"
 }
 
 save_settings() {
@@ -58,6 +66,10 @@ save_settings() {
 		printf 'LAUNCH_PACKAGE=%s\n' "$LAUNCH_PACKAGE"
 		printf 'HEALTH_PORT=%s\n' "$HEALTH_PORT"
 		printf 'HEALTH_PATH=%s\n' "$HEALTH_PATH"
+		printf 'CLICK_X1=%s\n' "$CLICK_X1"
+		printf 'CLICK_Y1=%s\n' "$CLICK_Y1"
+		printf 'CLICK_X2=%s\n' "$CLICK_X2"
+		printf 'CLICK_Y2=%s\n' "$CLICK_Y2"
 	} >"$SETTINGS_FILE" || exit
 }
 
@@ -964,6 +976,91 @@ lunafast_screensaver_upload_serials_logged() {
 	return "$_err"
 }
 
+lunafast_is_nonneg_int() {
+	case "$1" in
+	'' | *[!0-9]*) return 1 ;;
+	esac
+	return 0
+}
+
+lunafast_click_area_apply_one_to_log() {
+	_serial=$1
+	_x1=$2
+	_y1=$3
+	_x2=$4
+	_y2=$5
+	_log=$6
+	if ! _host=$(lunafast_serial_http_host "$_serial"); then
+		{
+			printf '%s\n' "########################################"
+			printf '%s\n' "# serial: $_serial — кликабельная зона"
+			printf '%s\n' "########################################"
+			printf '%s\n' "НЕ ОК · нет сетевого host в serial (например USB)"
+			printf '%s\n' ""
+		} >>"$_log"
+		return 1
+	fi
+	_url=$(printf 'http://%s:%s/click-area' "$_host" "${HEALTH_PORT:-8080}")
+	_body=$(mktemp) || return 1
+	_cerr=$(mktemp) || {
+		rm -f "$_body"
+		return 1
+	}
+	_payload=$(printf '{"x1":%s,"y1":%s,"x2":%s,"y2":%s}' "$_x1" "$_y1" "$_x2" "$_y2")
+	{
+		printf '%s\n' "########################################"
+		printf '%s\n' "# serial: $_serial — POST click-area"
+		printf '%s\n' "# URL: $_url"
+		printf '%s\n' "# payload: $_payload"
+		printf '%s\n' "########################################"
+	} >>"$_log"
+	_http=$(curl --location --silent --show-error --connect-timeout 5 --max-time 30 \
+		--request POST "$_url" \
+		--header "Content-Type: application/json" \
+		--data "$_payload" \
+		--write-out "%{http_code}" \
+		--output "$_body" 2>"$_cerr") || true
+	_ce=$?
+	printf '%s\n' "--- stderr curl ---" >>"$_log"
+	cat "$_cerr" >>"$_log" 2>/dev/null || true
+	printf '%s\n' "--- тело ответа ---" >>"$_log"
+	cat "$_body" >>"$_log" 2>/dev/null || true
+	printf '\n%s\n' "--- HTTP: ${_http:-?} · код выхода curl: $_ce ---" >>"$_log"
+	rm -f "$_body" "$_cerr"
+	_ok=0
+	case "${_http:-}" in
+	2??)
+		if [ "$_ce" -eq 0 ]; then
+			_ok=1
+		fi
+		;;
+	esac
+	if [ "$_ok" -eq 1 ]; then
+		printf '%s\n' "Итог: ОК" >>"$_log"
+	else
+		printf '%s\n' "Итог: НЕ ОК" >>"$_log"
+	fi
+	printf '%s\n' "" >>"$_log"
+	if [ "$_ok" -eq 1 ]; then return 0; fi
+	return 1
+}
+
+lunafast_click_area_apply_serials_logged() {
+	_serf=$1
+	_x1=$2
+	_y1=$3
+	_x2=$4
+	_y2=$5
+	_log=$6
+	_err=0
+	while read -r raw || [ -n "$raw" ]; do
+		_s=$(serial_clean "$raw")
+		[ -z "$_s" ] && continue
+		lunafast_click_area_apply_one_to_log "$_s" "$_x1" "$_y1" "$_x2" "$_y2" "$_log" || _err=1
+	done <"$_serf"
+	return "$_err"
+}
+
 # Расширенная тема dialog: классические серо-белые окна (как типичный новодialog)
 lunafast_write_dialogrc() {
 	d=$(state_dir)
@@ -1770,6 +1867,7 @@ dialog_flash_menu() {
 			6 "Запуск приложения на сохранённом списке (adb am start …)" \
 			7 "КриптоПро: загрузить контейнер (PUT …/cryptopro/upload/container)" \
 			8 "Заставка: отправить файл из screensaver/ (POST …/screensaver)" \
+			9 "Кликабельная зона: POST /click-area (дефолт/ручной/скрыть)" \
 			0 "◀ Назад в главное меню") || break
 		case "$b" in
 		1) dialog_connect_ip ;;
@@ -1780,6 +1878,7 @@ dialog_flash_menu() {
 		6) dialog_launch_app_saved ;;
 		7) dialog_cryptopro_upload_saved ;;
 		8) dialog_screensaver_upload_saved ;;
+		9) dialog_click_area_saved ;;
 		0) break ;;
 		esac
 	done
@@ -2080,6 +2179,68 @@ dialog_screensaver_upload_saved() {
 	fi
 }
 
+dialog_click_area_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.2 — выбор устройств." 7 55
+		return
+	fi
+	command -v curl >/dev/null 2>&1 || {
+		dialog --msgbox "Нужен curl в PATH (POST JSON)." 6 50
+		return 1
+	}
+	load_settings
+	mode=$(dialog --stdout --title "[ Прошивка › кликабельная зона ]" \
+		--menu "Выберите режим:" 14 74 4 \
+		1 "Дефолт (нижняя часть): ${CLICK_X1},${CLICK_Y1},${CLICK_X2},${CLICK_Y2}" \
+		2 "Ввести координаты вручную (x1,y1,x2,y2)" \
+		3 "Скрыть зону (0,0,0,0)" \
+		0 "Отмена") || return
+	case "$mode" in
+	0 | "") return ;;
+	1)
+		x1=$CLICK_X1; y1=$CLICK_Y1; x2=$CLICK_X2; y2=$CLICK_Y2
+		;;
+	2)
+		x1=$(dialog --stdout --inputbox "x1 (верхний левый угол):" 8 56 "$CLICK_X1") || return
+		y1=$(dialog --stdout --inputbox "y1 (верхний левый угол):" 8 56 "$CLICK_Y1") || return
+		x2=$(dialog --stdout --inputbox "x2 (правый нижний угол):" 8 56 "$CLICK_X2") || return
+		y2=$(dialog --stdout --inputbox "y2 (правый нижний угол):" 8 56 "$CLICK_Y2") || return
+		;;
+	3)
+		x1=0; y1=0; x2=0; y2=0
+		;;
+	*) return ;;
+	esac
+	for _v in "$x1" "$y1" "$x2" "$y2"; do
+		lunafast_is_nonneg_int "$_v" || {
+			dialog --msgbox "Координаты должны быть целыми >= 0." 6 50
+			return 1
+		}
+	done
+	_nd=$(wc -l <"$f" | tr -d ' ')
+	dialog --yesno "Применить кликабельную зону на $_nd устройство(в)?\n\nx1=$x1  y1=$y1  x2=$x2  y2=$y2\nPOST …/click-area · порт HTTP ${HEALTH_PORT}" 12 74 || return
+	rep=$(mktemp) || {
+		dialog --msgbox "Не удалось создать временный файл журнала." 6 60
+		return 1
+	}
+	if ! lunafast_begin_log_section "$rep" "Кликабельная зона: POST click-area · x1=$x1 y1=$y1 x2=$x2 y2=$y2"; then
+		rm -f "$rep"
+		dialog --msgbox "Не удалось записать журнал (сессия)." 8 72
+		return 1
+	fi
+	lunafast_click_area_apply_serials_logged "$f" "$x1" "$y1" "$x2" "$y2" "$rep"
+	ret=$?
+	lunafast_end_log_section "$rep" "$ret"
+	lunafast_prepend_session_to_project_log "$rep" || true
+	proj=$(lunafast_project_log_path)
+	dialog --title "[ журнал · click-area ]" --cr-wrap --textbox "$proj" 30 94
+	rm -f "$rep"
+	if [ "$ret" -ne 0 ]; then
+		dialog --msgbox "Есть ошибки (код $ret).\n\nЖурнал: $proj · главное меню п.5" 12 72
+	fi
+}
+
 dialog_install_wizard() {
 	load_settings
 	ensure_adb
@@ -2164,10 +2325,28 @@ dialog_settings() {
 	hp_path=$(dialog --stdout --title "[ HTTP health путь ]" \
 		--inputbox "Путь URI (начиная с /), например /healthcheck:" 9 76 "$HEALTH_PATH") || return
 	[ -n "$hp_path" ] && HEALTH_PATH=$hp_path
+	cx1=$(dialog --stdout --title "[ click-area дефолт ]" \
+		--inputbox "x1 (по умолчанию, нижняя зона):" 8 60 "$CLICK_X1") || return
+	cy1=$(dialog --stdout --title "[ click-area дефолт ]" \
+		--inputbox "y1 (по умолчанию, нижняя зона):" 8 60 "$CLICK_Y1") || return
+	cx2=$(dialog --stdout --title "[ click-area дефолт ]" \
+		--inputbox "x2 (по умолчанию, нижняя зона):" 8 60 "$CLICK_X2") || return
+	cy2=$(dialog --stdout --title "[ click-area дефолт ]" \
+		--inputbox "y2 (по умолчанию, нижняя зона):" 8 60 "$CLICK_Y2") || return
+	for _v in "$cx1" "$cy1" "$cx2" "$cy2"; do
+		lunafast_is_nonneg_int "$_v" || {
+			dialog --msgbox "CLICK_* должны быть целыми >= 0." 6 48
+			return 1
+		}
+	done
+	CLICK_X1=$cx1
+	CLICK_Y1=$cy1
+	CLICK_X2=$cx2
+	CLICK_Y2=$cy2
 	save_settings
 	LUNAFAST_MENU_DEFAULT_ITEM=3
 	export LUNAFAST_MENU_DEFAULT_ITEM
-	dialog --msgbox "Сохранено в $(settings_file)\n\nСкан подсети не запускается.\nПоиск в LAN — отдельно, пункт «Сеть › поиск…».\nLAUNCH_PACKAGE — п.6 Прошивка.\nHEALTH_PORT — главное меню п.7 (GET health), Прошивка п.7 (PUT КриптоПро) и п.8 (POST заставка).\nHEALTH_PATH — только для GET health." 17 68
+	dialog --msgbox "Сохранено в $(settings_file)\n\nСкан подсети не запускается.\nПоиск в LAN — отдельно, пункт «Сеть › поиск…».\nLAUNCH_PACKAGE — п.6 Прошивка.\nHEALTH_PORT — главное меню п.7 (GET health), Прошивка п.7 (PUT КриптоПро), п.8 (POST заставка) и п.9 (POST click-area).\nHEALTH_PATH — только для GET health.\nCLICK_X1..CLICK_Y2 — дефолт зоны для Прошивка п.9." 19 72
 }
 
 # ═══════════════ текст: псевдографика ═══════════════
@@ -2218,9 +2397,10 @@ text_flash_menu_txt() {
 		printf '│  6) Запуск приложения на сохранённом списке               │\n'
 		printf '│  7) КриптоПро: PUT контейнер (certs/ → сохранённые serial)   │\n'
 		printf '│  8) Заставка: POST из screensaver/ → HTTP …/screensaver   │\n'
+		printf '│  9) Кликабельная зона: POST /click-area                 │\n'
 		printf '│  0) ◀ Назад                                              │\n'
 		text_hline_bot 58
-		printf '%s' "Выбор [0-8]: "
+		printf '%s' "Выбор [0-9]: "
 		read -r b || return
 		case "$b" in
 		1)
@@ -2239,9 +2419,86 @@ text_flash_menu_txt() {
 		6) text_launch_saved_txt ;;
 		7) text_cryptopro_upload_txt ;;
 		8) text_screensaver_upload_txt ;;
+		9) text_click_area_saved_txt ;;
 		0) break ;;
 		esac
 	done
+}
+
+text_click_area_saved_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.2 — список устройств."
+		read -r _
+		return
+	fi
+	command -v curl >/dev/null 2>&1 || {
+		printf '%s\n' "Нужен curl в PATH."
+		read -r _
+		return 1
+	}
+	load_settings
+	printf '%s\n' "Режим: 1) дефолт  2) вручную  3) скрыть (0,0,0,0)  0) отмена"
+	printf '%s' "? "
+	read -r mode || return
+	case "$mode" in
+	0 | "") return ;;
+	1)
+		x1=$CLICK_X1; y1=$CLICK_Y1; x2=$CLICK_X2; y2=$CLICK_Y2
+		;;
+	2)
+		printf '%s' "x1 [$CLICK_X1]: "; read -r x1 || return; [ -z "$x1" ] && x1=$CLICK_X1
+		printf '%s' "y1 [$CLICK_Y1]: "; read -r y1 || return; [ -z "$y1" ] && y1=$CLICK_Y1
+		printf '%s' "x2 [$CLICK_X2]: "; read -r x2 || return; [ -z "$x2" ] && x2=$CLICK_X2
+		printf '%s' "y2 [$CLICK_Y2]: "; read -r y2 || return; [ -z "$y2" ] && y2=$CLICK_Y2
+		;;
+	3)
+		x1=0; y1=0; x2=0; y2=0
+		;;
+	*)
+		printf '%s\n' "Отменено."
+		return
+		;;
+	esac
+	for _v in "$x1" "$y1" "$x2" "$y2"; do
+		lunafast_is_nonneg_int "$_v" || {
+			printf '%s\n' "Координаты должны быть целыми >= 0."
+			read -r _
+			return 1
+		}
+	done
+	printf '%s\n' "Применить x1=$x1 y1=$y1 x2=$x2 y2=$y2 на устройства ниже? [y/N]"
+	cat "$f"
+	read -r yn || return
+	case "$yn" in
+	y | Y | yes | YES | д | Д) ;;
+	*)
+		printf '%s\n' "Отменено."
+		read -r _
+		return
+		;;
+	esac
+	lg=$(mktemp) || {
+		printf '%s\n' "Не удалось создать журнал."
+		read -r _
+		return 1
+	}
+	lunafast_begin_log_section "$lg" "Кликабельная зона: POST click-area · x1=$x1 y1=$y1 x2=$x2 y2=$y2" || {
+		rm -f "$lg"
+		printf '%s\n' "Не удалось начать сессию журнала."
+		read -r _
+		return 1
+	}
+	lunafast_click_area_apply_serials_logged "$f" "$x1" "$y1" "$x2" "$y2" "$lg"
+	ret=$?
+	lunafast_end_log_section "$lg" "$ret"
+	lunafast_prepend_session_to_project_log "$lg" || true
+	proj=$(lunafast_project_log_path)
+	printf '%s\n' "--- журнал $proj (сверху — эта операция), код $ret ---"
+	head -n 120 "$proj"
+	printf '%s\n' "--- Enter ---"
+	read -r _
+	rm -f "$lg"
 }
 
 text_cryptopro_upload_txt() {
@@ -2636,6 +2893,25 @@ menu_settings_text() {
 	printf '%s' "Health URI-путь [$HEALTH_PATH] (Enter = не менять): "
 	read -r hp || true
 	[ -n "$hp" ] && HEALTH_PATH=$hp
+	printf '%s' "CLICK_X1 [$CLICK_X1] (дефолт click-area): "
+	read -r cx1 || true
+	[ -n "$cx1" ] && CLICK_X1=$cx1
+	printf '%s' "CLICK_Y1 [$CLICK_Y1]: "
+	read -r cy1 || true
+	[ -n "$cy1" ] && CLICK_Y1=$cy1
+	printf '%s' "CLICK_X2 [$CLICK_X2]: "
+	read -r cx2 || true
+	[ -n "$cx2" ] && CLICK_X2=$cx2
+	printf '%s' "CLICK_Y2 [$CLICK_Y2]: "
+	read -r cy2 || true
+	[ -n "$cy2" ] && CLICK_Y2=$cy2
+	for _v in "$CLICK_X1" "$CLICK_Y1" "$CLICK_X2" "$CLICK_Y2"; do
+		lunafast_is_nonneg_int "$_v" || {
+			printf '%s\n' "CLICK_* должны быть целыми >= 0."
+			read -r _
+			return
+		}
+	done
 	save_settings
 	printf '%s\n' "Сохранено: $(settings_file)"
 	read -r _
