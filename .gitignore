@@ -1,0 +1,17 @@
+# Журнал установок (дописывает tablet_deploy.sh)
+lunafast_install.log
+
+# APK
+apks/*
+!apks/.gitkeep
+
+# Контейнеры КриптоПро / архивы (кладите локально; не коммитить)
+certs/*
+!certs/.gitkeep
+
+# Заставки (кладите локально; не коммитить)
+screensaver/*
+!screensaver/.gitkeep
+
+__pycache__/
+*.py[cod]
