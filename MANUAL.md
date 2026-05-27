@@ -16,6 +16,7 @@
 5. Установить APK/XAPK на сохранённый список  
 6. Запуск приложения на сохранённом списке  
 7. HTTP API операции: КриптоПро / screensaver / click-area / light  
+8. **Сделать launcher** — отключить штатный launcher, назначить HOME (`ai.visionlabs.transactionapp`, `ai.visionlabs.lunafast2nextgen` или свой package)  
 0. Назад  
 
 **Без `dialog`:** те же номера в текстовых рамках.

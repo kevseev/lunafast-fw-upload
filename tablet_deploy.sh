@@ -7,6 +7,7 @@ set_defaults() {
 	ADB_PORT=5555
 	SCAN_SUBNET=192.168.1
 	LAUNCH_PACKAGE=
+	LAUNCHER_PACKAGE=
 	HEALTH_PORT=8080
 	HEALTH_PATH=/healthcheck
 	CLICK_X1=5
@@ -18,6 +19,10 @@ set_defaults() {
 
 DEFAULT_HOST1=192.168.1.211
 DEFAULT_HOST2=192.168.1.213
+
+# Пресеты для пункта «Сделать launcher» (HOME)
+LUNAFAST_LAUNCHER_PRESET_TXN=ai.visionlabs.transactionapp
+LUNAFAST_LAUNCHER_PRESET_NEXTGEN=ai.visionlabs.lunafast2nextgen
 
 settings_file() {
 	if [ -n "$LUNAFAST_CONFIG" ]; then
@@ -50,6 +55,7 @@ load_settings() {
 	: "${ADB_PORT:=5555}"
 	: "${SCAN_SUBNET:=192.168.1}"
 	: "${LAUNCH_PACKAGE:=}"
+	: "${LAUNCHER_PACKAGE:=}"
 	: "${HEALTH_PORT:=8080}"
 	: "${HEALTH_PATH:=/healthcheck}"
 	: "${CLICK_X1:=5}"
@@ -74,6 +80,7 @@ save_settings() {
 		printf 'ADB_PORT=%s\n' "$ADB_PORT"
 		printf 'SCAN_SUBNET=%s\n' "$SCAN_SUBNET"
 		printf 'LAUNCH_PACKAGE=%s\n' "$LAUNCH_PACKAGE"
+		printf 'LAUNCHER_PACKAGE=%s\n' "$LAUNCHER_PACKAGE"
 		printf 'HEALTH_PORT=%s\n' "$HEALTH_PORT"
 		printf 'HEALTH_PATH=%s\n' "$HEALTH_PATH"
 		printf 'CLICK_X1=%s\n' "$CLICK_X1"
@@ -1780,6 +1787,170 @@ lunafast_launch_pkg_on_serials() {
 	return "$_err"
 }
 
+# package:com.example.app → com.example.app
+lunafast_normalize_package_id() {
+	_p=$(lunafast_trim "$1")
+	case "$_p" in
+	package:*) _p=${_p#package:} ;;
+	esac
+	printf '%s' "$(lunafast_trim "$_p")"
+}
+
+# Штатные launcher-пакеты для отключения (если установлены и это не целевой пакет)
+lunafast_stock_launcher_packages() {
+	printf '%s\n' \
+		com.android.launcher3 \
+		com.google.android.apps.nexuslauncher \
+		com.android.launcher2 \
+		com.miui.home \
+		com.huawei.android.launcher \
+		com.sec.android.app.launcher
+}
+
+# Компонент HOME (package/Activity) для set-home-activity
+lunafast_pkg_home_component() {
+	_serial=$1
+	_pkg=$2
+	_brief=$(lunafast_adb_linebuf -s "$_serial" shell cmd package query-activities --brief -a android.intent.action.MAIN \
+		-c android.intent.category.HOME "$_pkg" 2>/dev/null) || _brief=
+	_comp=$(printf '%s\n' "$_brief" | sed -n "s|^[[:space:]]*\(${_pkg}/[^[:space:]]*\).*|\1|p" | head -n 1)
+	if [ -n "$_comp" ]; then
+		printf '%s' "$_comp"
+		return 0
+	fi
+	_dump=$(lunafast_adb_linebuf -s "$_serial" shell pm dump "$_pkg" 2>/dev/null) || return 1
+	_comp=$(printf '%s\n' "$_dump" | sed -n "
+		/Category: android.intent.category.HOME/,\$ {
+			s|.*\\(${_pkg}/[A-Za-z0-9_.]*\\).*|\1|p
+			t found
+			b
+			:found
+			q
+		}
+	" | head -n 1)
+	[ -n "$_comp" ] || return 1
+	printf '%s' "$_comp"
+}
+
+lunafast_launcher_apply_one_to_log() {
+	_serial=$1
+	_pkg=$2
+	_log=$3
+	_err=0
+	{
+		printf '%s\n' "########################################"
+		printf '%s\n' "# serial: $_serial — launcher (HOME)"
+		printf '%s\n' "# целевой пакет: $_pkg"
+		printf '%s\n' "########################################"
+	} >>"$_log"
+	_pkg=$(lunafast_normalize_package_id "$_pkg")
+	if [ -z "$_pkg" ]; then
+		printf '%s\n' "НЕ ОК · пустой package id" >>"$_log"
+		printf '%s\n' "" >>"$_log"
+		return 1
+	fi
+	printf '%s\n' "--- pm clear-package-preferred-activities ---" >>"$_log"
+	lunafast_adb_linebuf -s "$_serial" shell pm clear-package-preferred-activities 2>&1 >>"$_log" || true
+	printf '%s\n' "--- отключение штатных launcher (pm disable-user) ---" >>"$_log"
+	while read -r _stock || [ -n "$_stock" ]; do
+		_stock=$(lunafast_trim "$_stock")
+		[ -z "$_stock" ] && continue
+		[ "$_stock" = "$_pkg" ] && continue
+		if lunafast_adb_linebuf -s "$_serial" shell pm list packages 2>/dev/null | grep -qF "package:${_stock}"; then
+			printf '%s\n' "# $_stock" >>"$_log"
+			lunafast_adb_linebuf -s "$_serial" shell pm disable-user --user 0 "$_stock" 2>&1 >>"$_log" || _err=1
+		else
+			printf '%s\n' "# $_stock — не установлен, пропуск" >>"$_log"
+		fi
+	done <<-STOCK_PKGS
+		$(lunafast_stock_launcher_packages)
+	STOCK_PKGS
+	printf '%s\n' "--- pm enable $_pkg ---" >>"$_log"
+	lunafast_adb_linebuf -s "$_serial" shell pm enable "$_pkg" 2>&1 >>"$_log" || true
+	printf '%s\n' "--- cmd role add-role-holder android.app.role.HOME ---" >>"$_log"
+	lunafast_adb_linebuf -s "$_serial" shell cmd role add-role-holder android.app.role.HOME "$_pkg" 0 2>&1 >>"$_log" || _err=1
+	_comp=$(lunafast_pkg_home_component "$_serial" "$_pkg") || _comp=
+	if [ -n "$_comp" ]; then
+		printf '%s\n' "--- cmd package set-home-activity $_comp ---" >>"$_log"
+		lunafast_adb_linebuf -s "$_serial" shell cmd package set-home-activity --user 0 "$_comp" 2>&1 >>"$_log" || _err=1
+	else
+		printf '%s\n' "(компонент HOME не найден — только role holder)" >>"$_log"
+	fi
+	printf '%s\n' "--- проверка: role get-role-holders HOME ---" >>"$_log"
+	lunafast_adb_linebuf -s "$_serial" shell cmd role get-role-holders android.app.role.HOME 2>&1 >>"$_log" || true
+	if [ "$_err" -eq 0 ]; then
+		printf '%s\n' "Итог: ОК" >>"$_log"
+	else
+		printf '%s\n' "Итог: НЕ ОК (см. вывод adb выше)" >>"$_log"
+	fi
+	printf '%s\n' "" >>"$_log"
+	return "$_err"
+}
+
+lunafast_launcher_apply_serials_logged() {
+	_serf=$1
+	_pkg=$2
+	_log=$3
+	_err=0
+	_any=1
+	while read -r raw || [ -n "$raw" ]; do
+		_s=$(serial_clean "$raw")
+		[ -z "$_s" ] && continue
+		_any=0
+		lunafast_launcher_apply_one_to_log "$_s" "$_pkg" "$_log" || _err=1
+	done <"$_serf"
+	[ "$_any" -eq 1 ] && return 1
+	return "$_err"
+}
+
+# stdout: выбранный package id; код 1 — отмена
+lunafast_dialog_pick_launcher_pkg() {
+	load_settings
+	choice=$(dialog --stdout --title "[ Прошивка › launcher ]" \
+		--menu "Сначала отключаются штатные launcher, затем назначается HOME (↑↓, Enter):" 14 78 4 \
+		1 "$LUNAFAST_LAUNCHER_PRESET_TXN" \
+		2 "$LUNAFAST_LAUNCHER_PRESET_NEXTGEN" \
+		3 "Другой package id (ввод вручную)" \
+		0 "Отмена") || return 1
+	case "$choice" in
+	0 | "") return 1 ;;
+	1) printf '%s' "$LUNAFAST_LAUNCHER_PRESET_TXN" ;;
+	2) printf '%s' "$LUNAFAST_LAUNCHER_PRESET_NEXTGEN" ;;
+	3)
+		raw=$(dialog --stdout --title "[ package id ]" \
+			--inputbox "Имя пакета (можно package:…):" 11 76 "$LAUNCHER_PACKAGE") || return 1
+		pkg=$(lunafast_normalize_package_id "$raw")
+		[ -z "$pkg" ] && return 1
+		printf '%s' "$pkg"
+		;;
+	*) return 1 ;;
+	esac
+}
+
+lunafast_text_pick_launcher_pkg() {
+	load_settings
+	printf '%s\n' "Пакет для HOME (launcher):"
+	printf '  1) %s\n' "$LUNAFAST_LAUNCHER_PRESET_TXN"
+	printf '  2) %s\n' "$LUNAFAST_LAUNCHER_PRESET_NEXTGEN"
+	printf '%s\n' "  3) ввести вручную"
+	printf '%s\n' "  0) отмена"
+	printf '%s' "? "
+	read -r choice || return 1
+	case "$choice" in
+	0 | "") return 1 ;;
+	1) printf '%s' "$LUNAFAST_LAUNCHER_PRESET_TXN" ;;
+	2) printf '%s' "$LUNAFAST_LAUNCHER_PRESET_NEXTGEN" ;;
+	3)
+		printf '%s' "Package id [${LAUNCHER_PACKAGE}]: "
+		read -r raw || return 1
+		pkg=$(lunafast_normalize_package_id "$raw")
+		[ -z "$pkg" ] && return 1
+		printf '%s' "$pkg"
+		;;
+	*) return 1 ;;
+	esac
+}
+
 is_adb_target() {
 	case "$1" in
 	*:*:*) return 0 ;;
@@ -1955,7 +2126,7 @@ dialog_flash_menu() {
 		b=$(dialog --stdout --clear \
 			--title "[ Прошивка ] ─ вложенное меню" \
 			--menu "Логика: сначала сохраните цели (п.3), затем выполняйте операции.
-HTTP-действия вынесены в отдельный подпункт." 22 84 9 \
+HTTP-действия вынесены в отдельный подпункт." 23 84 10 \
 			1 "Мастер: connect → APK/XAPK → checklist → установка" \
 			2 "Подключить вручную: IP:PORT" \
 			3 "Выбор устройств для операций (checklist → сохранить)" \
@@ -1963,6 +2134,7 @@ HTTP-действия вынесены в отдельный подпункт." 
 			5 "Установить APK / XAPK на сохранённый список" \
 			6 "Запуск приложения на сохранённом списке (adb am start …)" \
 			7 "HTTP API операции (КриптоПро / заставка / click-area / light)" \
+			8 "Сделать launcher: отключить штатный → HOME-приложение" \
 			0 "◀ Назад в главное меню") || break
 		case "$b" in
 		1) dialog_install_wizard ;;
@@ -1972,6 +2144,7 @@ HTTP-действия вынесены в отдельный подпункт." 
 		5) dialog_install_saved ;;
 		6) dialog_launch_app_saved ;;
 		7) dialog_http_actions_menu ;;
+		8) dialog_launcher_saved ;;
 		0) break ;;
 		esac
 	done
@@ -2207,6 +2380,50 @@ dialog_launch_app_saved() {
 		dialog --msgbox "Ошибка запуска (нет вывода).\nКод: $ex" 7 50
 	fi
 	rm -f "$tmp"
+}
+
+dialog_launcher_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.3 — выбор устройств." 7 55
+		return
+	fi
+	load_settings
+	ensure_adb
+	pkg=$(lunafast_dialog_pick_launcher_pkg) || return
+	pkg=$(lunafast_normalize_package_id "$pkg")
+	if [ -z "$pkg" ]; then
+		dialog --msgbox "Пустое имя пакета." 5 42
+		return
+	fi
+	_nd=$(wc -l <"$f" | tr -d ' ')
+	dialog --yesno "На $_nd устройстве(в)?
+
+1) pm disable-user — штатные launcher (launcher3 и др.)
+2) pm enable + role HOME + set-home-activity
+
+Пакет: $pkg" 14 74 || return
+	rep=$(mktemp) || {
+		dialog --msgbox "Не удалось создать временный файл журнала." 6 60
+		return 1
+	}
+	if ! lunafast_begin_log_section "$rep" "Launcher HOME: $pkg"; then
+		rm -f "$rep"
+		dialog --msgbox "Не удалось записать журнал (сессия)." 8 72
+		return 1
+	fi
+	lunafast_launcher_apply_serials_logged "$f" "$pkg" "$rep"
+	ret=$?
+	lunafast_end_log_section "$rep" "$ret"
+	LAUNCHER_PACKAGE=$pkg
+	save_settings
+	dialog --title "[ launcher — отчёт ]" --cr-wrap --textbox "$rep" 26 90
+	lunafast_prepend_session_to_project_log "$rep" || true
+	proj=$(lunafast_project_log_path)
+	rm -f "$rep"
+	if [ "$ret" -ne 0 ]; then
+		dialog --msgbox "Есть ошибки (код $ret).\n\nПолный журнал: $proj · главное меню п.5" 12 72
+	fi
 }
 
 dialog_cryptopro_upload_saved() {
@@ -2485,6 +2702,9 @@ dialog_settings() {
 	lp=$(dialog --stdout --title "[ пакет для запуска приложения ]" \
 		--inputbox "Имя пакета для «Запуск приложения» [пусто — каждый раз вручную]:" 11 70 "$LAUNCH_PACKAGE") || return
 	LAUNCH_PACKAGE=$(lunafast_trim "$lp")
+	lpk=$(dialog --stdout --title "[ launcher — ручной ввод по умолчанию ]" \
+		--inputbox "LAUNCHER_PACKAGE для п.8 «Сделать launcher» [пусто — без дефолта]:" 11 70 "$LAUNCHER_PACKAGE") || return
+	LAUNCHER_PACKAGE=$(lunafast_normalize_package_id "$lpk")
 	hp=$(dialog --stdout --title "[ HTTP health главное меню › п.7 ]" \
 		--inputbox "Порт HTTP API на устройстве (например 8080):" 9 60 "$HEALTH_PORT") || return
 	[ -n "$hp" ] && HEALTH_PORT=$hp
@@ -2524,6 +2744,7 @@ dialog_settings() {
 Скан подсети не запускается.
 Поиск в LAN — отдельно, пункт «Сеть › поиск…».
 LAUNCH_PACKAGE — пункт «Запуск приложения» в разделе «Прошивка».
+LAUNCHER_PACKAGE — дефолт для ручного ввода в п.8 «Сделать launcher».
 HEALTH_PORT — главное меню п.7 (GET health) и HTTP-подменю в «Прошивка» (КриптоПро, заставка, click-area, light).
 HEALTH_PATH — только для GET health.
 CLICK_X1..CLICK_Y2 — дефолт для POST /click-area.
@@ -2586,10 +2807,12 @@ text_flash_menu_txt() {
 '
 		printf '│  7) HTTP API: КриптоПро / заставка / click-area / light  │
 '
+		printf '│  8) Сделать launcher (штатный → HOME-приложение)         │
+'
 		printf '│  0) ◀ Назад                                              │
 '
 		text_hline_bot 58
-		printf '%s' "Выбор [0-7]: "
+		printf '%s' "Выбор [0-8]: "
 		read -r b || return
 		case "$b" in
 		1) menu_install_text ;;
@@ -2608,9 +2831,64 @@ text_flash_menu_txt() {
 		5) text_install_saved_txt ;;
 		6) text_launch_saved_txt ;;
 		7) text_http_actions_menu_txt ;;
+		8) text_launcher_saved_txt ;;
 		0) break ;;
 		esac
 	done
+}
+
+text_launcher_saved_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.3 — список устройств."
+		read -r _
+		return
+	fi
+	load_settings
+	ensure_adb
+	pkg=$(lunafast_text_pick_launcher_pkg) || {
+		printf '%s\n' "Отмена."
+		read -r _
+		return
+	}
+	pkg=$(lunafast_normalize_package_id "$pkg")
+	if [ -z "$pkg" ]; then
+		printf '%s\n' "Пустой пакет."
+		read -r _
+		return
+	fi
+	printf '%s\n' "--- цели ---"
+	cat "$f"
+	printf '%s\n' "Сделать launcher (HOME) для \"$pkg\"? [y/N]"
+	read -r yn || return
+	case "$yn" in
+	y | Y | yes | YES | д | Д) ;;
+	*)
+		printf '%s\n' "Отменено."
+		read -r _
+		return
+		;;
+	esac
+	rep=$(mktemp) || return 1
+	if ! lunafast_begin_log_section "$rep" "Launcher HOME: $pkg"; then
+		rm -f "$rep"
+		return 1
+	fi
+	lunafast_launcher_apply_serials_logged "$f" "$pkg" "$rep"
+	ret=$?
+	lunafast_end_log_section "$rep" "$ret"
+	LAUNCHER_PACKAGE=$pkg
+	save_settings
+	printf '%s\n' "--- отчёт ---"
+	cat "$rep"
+	lunafast_prepend_session_to_project_log "$rep" || true
+	rm -f "$rep"
+	if [ "$ret" -eq 0 ]; then
+		printf '%s\n' "Готово. Пакет: $pkg"
+	else
+		printf '%s\n' "Были ошибки (код $ret)."
+	fi
+	read -r _
 }
 
 text_http_actions_menu_txt() {
@@ -3177,6 +3455,9 @@ menu_settings_text() {
 	printf '%s' "Пакет для запуска [${LAUNCH_PACKAGE:-—}] (Enter = не менять): "
 	read -r lp || true
 	[ -n "$lp" ] && LAUNCH_PACKAGE=$lp
+	printf '%s' "Launcher (ручной ввод) [${LAUNCHER_PACKAGE:-—}] (Enter = не менять): "
+	read -r lpk || true
+	[ -n "$lpk" ] && LAUNCHER_PACKAGE=$(lunafast_normalize_package_id "$lpk")
 	printf '%s' "Health HTTP-порт [:${HEALTH_PORT}] (Enter = не менять): "
 	read -r hh || true
 	[ -n "$hh" ] && HEALTH_PORT=$hh

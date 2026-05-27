@@ -23,7 +23,8 @@ sudo apt install dialog   # Debian/Ubuntu
     - КриптоПро (`PUT /cryptopro/upload/container`);
     - заставка (`POST /screensaver`);
     - кликабельная зона (`POST /click-area`);
-    - подсветка (`POST /light`, payload `{"command":"on","light_level":X}`).
+    - подсветка (`POST /light`, payload `{"command":"on","light_level":X}`);
+  - **п.8** — **launcher**: `pm disable-user` штатных launcher → `cmd role` HOME для `ai.visionlabs.transactionapp`, `ai.visionlabs.lunafast2nextgen` или своего package.
 
 ## Запуск
 
