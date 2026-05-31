@@ -44,6 +44,103 @@ selected_targets_file() {
 	printf '%s/selected_targets\n' "$(state_dir)"
 }
 
+# Устройства, найденные последним сканом LAN (ip:port), после скана — отключены от adb
+scanned_targets_file() {
+	printf '%s/scanned_devices\n' "$(state_dir)"
+}
+
+# Строки connect/disconnect в журнал, если задан LUNAFAST_ADB_LOG
+lunafast_adb_log_session() {
+	_m=$1
+	[ -n "${LUNAFAST_ADB_LOG:-}" ] && [ -n "$_m" ] && printf '%s\n' "$_m" >>"${LUNAFAST_ADB_LOG}"
+}
+
+# Подключение по serial (сеть — adb connect; USB — только get-state)
+lunafast_adb_connect_serial() {
+	_s=$(serial_clean "$1")
+	[ -z "$_s" ] && return 1
+	case "$_s" in
+	*:*)
+		_o=$(adb connect "$_s" 2>&1) || true
+		lunafast_adb_log_session "--- adb connect $_s ---"
+		lunafast_adb_log_session "$_o"
+		case "$_o" in
+		*connected* | *already*) ;;
+		*) return 1 ;;
+		esac
+		adb devices 2>/dev/null | awk -v s="$_s" '$1==s && $2=="device" { ok=1 } END { exit !ok }'
+		;;
+	*)
+		_st=$(adb -s "$_s" get-state 2>/dev/null) || _st=
+		lunafast_adb_log_session "--- adb (USB/emulator) get-state $_s ---"
+		lunafast_adb_log_session "${_st:-?}"
+		[ "$_st" = device ]
+		;;
+	esac
+}
+
+lunafast_adb_disconnect_serial() {
+	_s=$(serial_clean "$1")
+	[ -z "$_s" ] && return 0
+	case "$_s" in
+	*:*)
+		_o=$(adb disconnect "$_s" 2>&1) || true
+		lunafast_adb_log_session "--- adb disconnect $_s ---"
+		lunafast_adb_log_session "$_o"
+		;;
+	esac
+	return 0
+}
+
+# connect → get-state=device → disconnect
+lunafast_adb_verify_serial() {
+	_s=$(serial_clean "$1")
+	_logf=${2:-}
+	[ -z "$_s" ] && return 1
+	_old=${LUNAFAST_ADB_LOG:-}
+	[ -n "$_logf" ] && export LUNAFAST_ADB_LOG="$_logf"
+	_ok=0
+	if lunafast_adb_connect_serial "$_s"; then
+		_st=$(adb -s "$_s" get-state 2>/dev/null) || _st=
+		lunafast_adb_log_session "--- adb get-state (проверка) ---"
+		lunafast_adb_log_session "${_st:-?}"
+		[ "$_st" = device ] && _ok=1
+	fi
+	lunafast_adb_disconnect_serial "$_s"
+	if [ -n "$_logf" ]; then
+		export LUNAFAST_ADB_LOG="$_old"
+	else
+		unset LUNAFAST_ADB_LOG
+	fi
+	[ "$_ok" -eq 1 ]
+}
+
+# $_src (scanned_devices) → $_dst: только serial с успешной проверкой связи
+lunafast_adb_refresh_verified_file() {
+	_src=$1
+	_dst=$2
+	_logf=${3:-}
+	: >"$_dst" || return 1
+	[ -s "$_src" ] || return 1
+	while read -r raw || [ -n "$raw" ]; do
+		_s=$(serial_clean "$raw")
+		[ -z "$_s" ] && continue
+		if lunafast_adb_verify_serial "$_s" "$_logf"; then
+			printf '%s\n' "$_s" >>"$_dst"
+		fi
+	done <"$_src"
+	[ -s "$_dst" ]
+}
+
+# Убрать из потока adb push строки только с % передачи (в журнал — факты, не прогресс)
+lunafast_adb_filter_progress_lines() {
+	if command -v grep >/dev/null 2>&1; then
+		grep -vE '^[[:space:]]*[0-9]+%[[:space:]]*$|.*[[:space:]][0-9]+%[[:space:]]*$|^[[:space:]]*\[[0-9]+%\]|.*Pushing.*[0-9]+%|.*[0-9]+%[[:space:]]*\('
+	else
+		cat
+	fi
+}
+
 load_settings() {
 	set_defaults
 	SETTINGS_FILE=$(settings_file)
@@ -196,7 +293,7 @@ usage() {
 
   Заставка: Прошивка › HTTP API — файлы из screensaver/ → POST http://<IP>:HEALTH_PORT/screensaver (curl -F file=@файл), те же сохранённые serial (п.3), что и для APK; нужен curl; serial вида IP:PORT (не USB без сетевого host).
 
-  Health: главное меню п.7 — GET http://<host из serial>:HEALTH_PORT+HEALTH_PATH (по умолчанию :8080/healthcheck), колонки ОК/НЕ ОК; нужны curl или wget на ПК.
+  Health: Прошивка › п.9 — GET http://<host из serial>:HEALTH_PORT+HEALTH_PATH по сохранённому списку целей; нужны curl или wget на ПК.
 
   UI без dialog: текстовые рамки. apt install dialog (Debian/Ubuntu).
 В меню: серо-белая тема; при установке APK — шкала до 100% только после успешного pm install (копирование ≈0–85%, по %/байтам из adb или оценочно). XAPK: unzip."
@@ -230,13 +327,32 @@ lunafast_adb_push_has_progress() {
 	adb push --help 2>&1 | grep -q '\-\-progress' || adb --help 2>&1 | grep -q '\-\-progress'
 }
 
-# adb: построчная буферизация вывода (прогресс push чаще попадает в файл)
+# adb: connect → команда → disconnect (если передан -s SERIAL)
 lunafast_adb_linebuf() {
-	if command -v stdbuf >/dev/null 2>&1; then
-		stdbuf -oL -eL adb "$@"
-	else
-		adb "$@"
+	_s=
+	if [ "${1:-}" = "-s" ] && [ -n "${2:-}" ]; then
+		_s=$2
+		shift 2
 	fi
+	if [ -n "$_s" ]; then
+		lunafast_adb_connect_serial "$_s" || return 1
+	fi
+	if command -v stdbuf >/dev/null 2>&1; then
+		if [ -n "$_s" ]; then
+			stdbuf -oL -eL adb -s "$_s" "$@"
+		else
+			stdbuf -oL -eL adb "$@"
+		fi
+	else
+		if [ -n "$_s" ]; then
+			adb -s "$_s" "$@"
+		else
+			adb "$@"
+		fi
+	fi
+	_ec=$?
+	[ -n "$_s" ] && lunafast_adb_disconnect_serial "$_s"
+	return "$_ec"
 }
 
 lunafast_dialog_has_prgbox() {
@@ -274,14 +390,14 @@ lunafast_push_xfer_pct() {
 	printf '%s\n' "$_p"
 }
 
-# Лог вывода push: \r → newline (иначе итоговая строка «обрезана», например 9.8 MB/)
+# Лог push: итог и факты без строк % передачи
 lunafast_log_push_output() {
 	_logf=$1
 	_tmp=$2
 	_ec=$3
 	{
-		printf '%s\n' "--- adb push (полный вывод) ---"
-		tr '\r' '\n' <"$_tmp" 2>/dev/null
+		printf '%s\n' "--- adb push (итог, без % передачи) ---"
+		tr '\r' '\n' <"$_tmp" 2>/dev/null | lunafast_adb_filter_progress_lines | sed '/^[[:space:]]*$/d' | tail -30
 		printf '%s\n' "--- код выхода push: $_ec ---"
 	} >>"$_logf"
 }
@@ -308,6 +424,57 @@ lunafast_log_pkg_running_probe() {
 			|| printf '%s\n' "(нет совпадений в выборке dumpsys)"
 		printf '%s\n' ""
 	} >>"$_log" 2>&1
+}
+
+# После успешного install: выдать все объявленные runtime-разрешения (pm grant + appops)
+lunafast_grant_all_app_permissions_log() {
+	_s=$1
+	_pkg=$2
+	_log=$3
+	[ -z "$_pkg" ] && return 0
+	_n=0
+	_ok=0
+	_fail=0
+	{
+		printf '%s\n' "--- выдача всех разрешений: $_pkg ---"
+		printf '%s\n' "--- pm grant --all-permissions (Android 15+) ---"
+		_aap=$(lunafast_adb_linebuf -s "$_s" shell pm grant --all-permissions "$_pkg" 2>&1 || true)
+		printf '%s\n' "$_aap"
+	} >>"$_log" 2>&1
+	_dump=$(lunafast_adb_linebuf -s "$_s" shell dumpsys package "$_pkg" 2>/dev/null) || _dump=
+	_tf=$(mktemp) || return 0
+	: >"$_tf"
+	printf '%s\n' "$_dump" | grep -oE 'android\.permission\.[A-Za-z0-9_.]+: granted=false' \
+		| sed 's/: granted=false//' >>"$_tf" 2>/dev/null || true
+	printf '%s\n' "$_dump" | sed -n '/requested permissions:/,/install permissions:/p' 2>/dev/null \
+		| grep -oE 'android\.permission\.[A-Za-z0-9_.]+' >>"$_tf" 2>/dev/null || true
+	sort -u "$_tf" -o "$_tf" 2>/dev/null || true
+	while read -r _perm || [ -n "$_perm" ]; do
+		[ -z "$_perm" ] && continue
+		_n=$((_n + 1))
+		{
+			printf '%s\n' "--- pm grant $_pkg $_perm ---"
+			_gr=$(lunafast_adb_linebuf -s "$_s" shell pm grant "$_pkg" "$_perm" 2>&1 || true)
+			printf '%s\n' "$_gr"
+		} >>"$_log" 2>&1
+		case "$_gr" in
+		*Exception* | *Error* | *error* | *denied* | *Unknown*) _fail=$((_fail + 1)) ;;
+		*) _ok=$((_ok + 1)) ;;
+		esac
+	done <"$_tf"
+	rm -f "$_tf"
+	for _op in REQUEST_INSTALL_PACKAGES SYSTEM_ALERT_WINDOW GET_USAGE_STATS WRITE_SETTINGS MANAGE_EXTERNAL_STORAGE; do
+		{
+			printf '%s\n' "--- appops set $_pkg $_op allow ---"
+			_ao=$(lunafast_adb_linebuf -s "$_s" shell appops set "$_pkg" "$_op" allow 2>&1 || true)
+			printf '%s\n' "$_ao"
+		} >>"$_log" 2>&1
+	done
+	{
+		printf '%s\n' "--- итог выдачи разрешений: pm grant попыток=$_n, без явной ошибки=$_ok, с ошибкой=$_fail ---"
+		printf '%s\n' ""
+	} >>"$_log" 2>&1
+	return 0
 }
 
 # pm после push — в журнал (для объединённой шкалы с копированием)
@@ -347,6 +514,7 @@ lunafast_pm_steps_to_log() {
 			lunafast_adb_linebuf -s "$_s" shell pm list packages -f 2>&1 | grep -F "$_pkg" || printf '%s\n' "(пакет не в list — см. выше)"
 			printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 			lunafast_adb_linebuf -s "$_s" shell dumpsys package "$_pkg" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+			lunafast_grant_all_app_permissions_log "$_s" "$_pkg" "$_log"
 			lunafast_log_pkg_running_probe "$_s" "$_pkg" "$_log"
 		elif [ "$ec" -eq 0 ]; then
 			printf '%s\n' "(Имя пакета неизвестно — pm verify и проверка запущенности пропуск.)"
@@ -379,11 +547,18 @@ lunafast_dialog_gauge_apk_install() {
 			printf '%s\n' "0"
 			printf '%s\n' "Ошибка: adb не в PATH"
 		else
+			lunafast_adb_connect_serial "$ser" "$logf" || {
+				printf '%s\n' "1" >"$ecf"
+				rm -f "$tmp"
+				printf '%s\n' "0"
+				printf '%s\n' "Ошибка adb connect"
+				exit 0
+			}
 			tot=$(wc -c <"$loc" | tr -d ' ')
 			if lunafast_adb_push_has_progress; then
 				adb -s "$ser" push --progress "$loc" "$rem" >>"$tmp" 2>&1 &
 			else
-				lunafast_adb_linebuf -s "$ser" push "$loc" "$rem" >>"$tmp" 2>&1 &
+				adb -s "$ser" push "$loc" "$rem" >>"$tmp" 2>&1 &
 			fi
 			pp=$!
 			pulse=0
@@ -406,6 +581,7 @@ lunafast_dialog_gauge_apk_install() {
 			lunafast_log_push_output "$logf" "$tmp" "$ec_push"
 			rm -f "$tmp"
 			if [ "$ec_push" -ne 0 ]; then
+				lunafast_adb_disconnect_serial "$ser" "$logf"
 				printf '%s\n' "$ec_push" >"$ecf"
 				printf '%s\n' "0"
 				printf '%s\n' "Ошибка копирования на устройство"
@@ -445,6 +621,7 @@ lunafast_dialog_gauge_apk_install() {
 					printf '%s\n' "85"
 					printf '%s\n' "Внутренняя ошибка (mktemp)"
 				fi
+				lunafast_adb_disconnect_serial "$ser" "$logf"
 			fi
 		fi
 	) | dialog --clear --gauge "Установка: копирование → pm (100% = всё готово на устройстве)" 14 78 0 || true
@@ -503,7 +680,7 @@ sh "$LUNAFAST_R" 2>&1 | {
 	else
 		tr '\r' '\n'
 	fi
-} | {
+} | lunafast_adb_filter_progress_lines | {
 	if command -v stdbuf >/dev/null 2>&1; then
 		stdbuf -oL -eL tee -a "$LUNAFAST_LOGF"
 	else
@@ -538,7 +715,7 @@ sh "$LUNAFAST_R" 2>&1 | {
 	else
 		tr '\r' '\n'
 	fi
-} | {
+} | lunafast_adb_filter_progress_lines | {
 	if command -v stdbuf >/dev/null 2>&1; then
 		stdbuf -oL -eL tee -a "$LUNAFAST_CHUNK" "$LUNAFAST_LOGF"
 	else
@@ -560,7 +737,7 @@ EOS
 			else
 				tr '\r' '\n'
 			fi
-		} | {
+		} | lunafast_adb_filter_progress_lines | {
 			if command -v stdbuf >/dev/null 2>&1; then
 				stdbuf -oL -eL tee -a "$logf"
 			else
@@ -590,12 +767,63 @@ run_adb() {
 		adb "$@"
 	fi
 }
+lunafast_runner_session_connect() {
+	case "$LUNAFAST_S" in
+	*:*)
+		printf '%s\n' "--- adb connect $LUNAFAST_S ---"
+		_co=$(adb connect "$LUNAFAST_S" 2>&1) || true
+		printf '%s\n' "$_co"
+		;;
+	esac
+}
+lunafast_runner_session_disconnect() {
+	case "$LUNAFAST_S" in
+	*:*)
+		printf '%s\n' "--- adb disconnect $LUNAFAST_S ---"
+		_do=$(adb disconnect "$LUNAFAST_S" 2>&1) || true
+		printf '%s\n' "$_do"
+		;;
+	esac
+}
+lunafast_runner_grant_all_permissions() {
+	[ -z "${LUNAFAST_PKG:-}" ] && return 0
+	printf '%s\n' "--- выдача всех разрешений: $LUNAFAST_PKG ---"
+	printf '%s\n' "--- pm grant --all-permissions (Android 15+) ---"
+	run_adb -s "$LUNAFAST_S" shell pm grant --all-permissions "$LUNAFAST_PKG" 2>&1 || true
+	_dump=$(run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>/dev/null) || _dump=
+	_tf=$(mktemp) || return 0
+	: >"$_tf"
+	printf '%s\n' "$_dump" | grep -oE 'android\.permission\.[A-Za-z0-9_.]+: granted=false' \
+		| sed 's/: granted=false//' >>"$_tf" 2>/dev/null || true
+	printf '%s\n' "$_dump" | sed -n '/requested permissions:/,/install permissions:/p' 2>/dev/null \
+		| grep -oE 'android\.permission\.[A-Za-z0-9_.]+' >>"$_tf" 2>/dev/null || true
+	sort -u "$_tf" -o "$_tf" 2>/dev/null || true
+	_n=0 _ok=0 _fail=0
+	while read -r _perm || [ -n "$_perm" ]; do
+		[ -z "$_perm" ] && continue
+		_n=$((_n + 1))
+		printf '%s\n' "--- pm grant $LUNAFAST_PKG $_perm ---"
+		_gr=$(run_adb -s "$LUNAFAST_S" shell pm grant "$LUNAFAST_PKG" "$_perm" 2>&1) || _gr=
+		printf '%s\n' "$_gr"
+		case "$_gr" in
+		*Exception* | *Error* | *error* | *denied* | *Unknown*) _fail=$((_fail + 1)) ;;
+		*) _ok=$((_ok + 1)) ;;
+		esac
+	done <"$_tf"
+	rm -f "$_tf"
+	for _op in REQUEST_INSTALL_PACKAGES SYSTEM_ALERT_WINDOW GET_USAGE_STATS WRITE_SETTINGS MANAGE_EXTERNAL_STORAGE; do
+		printf '%s\n' "--- appops set $LUNAFAST_PKG $_op allow ---"
+		run_adb -s "$LUNAFAST_S" shell appops set "$LUNAFAST_PKG" "$_op" allow 2>&1 || true
+	done
+	printf '%s\n' "--- итог выдачи разрешений: pm grant попыток=$_n, без явной ошибки=$_ok, с ошибкой=$_fail ---"
+}
 ec=0
 : "${LUNAFAST_S:?}" "${LUNAFAST_A:?}" "${LUNAFAST_EC_FILE:?}"
 rmt="/data/local/tmp/lunafast_inst_$$.apk"
 printf '%s\n' "########################################"
 printf '%s\n' "# serial: $LUNAFAST_S"
 printf '%s\n' "########################################"
+lunafast_runner_session_connect
 printf '%s\n' "--- adb get-state ---"
 run_adb -s "$LUNAFAST_S" get-state 2>&1 || true
 printf '%s\n' "--- adb shell echo ping ---"
@@ -628,6 +856,7 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 	run_adb -s "$LUNAFAST_S" shell pm list packages -f 2>&1 | grep -F "$LUNAFAST_PKG" || printf '%s\n' "(пакет не в list — см. выше)"
 	printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 	run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+	lunafast_runner_grant_all_permissions
 	printf '%s\n' "--- проверка запущенности: $LUNAFAST_PKG ---"
 	printf '%s\n' "--- shell pidof ---"
 	_po=$(run_adb -s "$LUNAFAST_S" shell pidof "$LUNAFAST_PKG" 2>&1 || true)
@@ -647,6 +876,7 @@ elif [ "$ec" -eq 0 ]; then
 else
 	printf '%s\n' "ОШИБКА установки — см. вывод adb выше."
 fi
+lunafast_runner_session_disconnect
 printf '%s\n' ""
 printf '%s\n' "$ec" >"$LUNAFAST_EC_FILE"
 exit "$ec"
@@ -669,11 +899,62 @@ run_adb() {
 		adb "$@"
 	fi
 }
+lunafast_runner_session_connect() {
+	case "$LUNAFAST_S" in
+	*:*)
+		printf '%s\n' "--- adb connect $LUNAFAST_S ---"
+		_co=$(adb connect "$LUNAFAST_S" 2>&1) || true
+		printf '%s\n' "$_co"
+		;;
+	esac
+}
+lunafast_runner_session_disconnect() {
+	case "$LUNAFAST_S" in
+	*:*)
+		printf '%s\n' "--- adb disconnect $LUNAFAST_S ---"
+		_do=$(adb disconnect "$LUNAFAST_S" 2>&1) || true
+		printf '%s\n' "$_do"
+		;;
+	esac
+}
+lunafast_runner_grant_all_permissions() {
+	[ -z "${LUNAFAST_PKG:-}" ] && return 0
+	printf '%s\n' "--- выдача всех разрешений: $LUNAFAST_PKG ---"
+	printf '%s\n' "--- pm grant --all-permissions (Android 15+) ---"
+	run_adb -s "$LUNAFAST_S" shell pm grant --all-permissions "$LUNAFAST_PKG" 2>&1 || true
+	_dump=$(run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>/dev/null) || _dump=
+	_tf=$(mktemp) || return 0
+	: >"$_tf"
+	printf '%s\n' "$_dump" | grep -oE 'android\.permission\.[A-Za-z0-9_.]+: granted=false' \
+		| sed 's/: granted=false//' >>"$_tf" 2>/dev/null || true
+	printf '%s\n' "$_dump" | sed -n '/requested permissions:/,/install permissions:/p' 2>/dev/null \
+		| grep -oE 'android\.permission\.[A-Za-z0-9_.]+' >>"$_tf" 2>/dev/null || true
+	sort -u "$_tf" -o "$_tf" 2>/dev/null || true
+	_n=0 _ok=0 _fail=0
+	while read -r _perm || [ -n "$_perm" ]; do
+		[ -z "$_perm" ] && continue
+		_n=$((_n + 1))
+		printf '%s\n' "--- pm grant $LUNAFAST_PKG $_perm ---"
+		_gr=$(run_adb -s "$LUNAFAST_S" shell pm grant "$LUNAFAST_PKG" "$_perm" 2>&1) || _gr=
+		printf '%s\n' "$_gr"
+		case "$_gr" in
+		*Exception* | *Error* | *error* | *denied* | *Unknown*) _fail=$((_fail + 1)) ;;
+		*) _ok=$((_ok + 1)) ;;
+		esac
+	done <"$_tf"
+	rm -f "$_tf"
+	for _op in REQUEST_INSTALL_PACKAGES SYSTEM_ALERT_WINDOW GET_USAGE_STATS WRITE_SETTINGS MANAGE_EXTERNAL_STORAGE; do
+		printf '%s\n' "--- appops set $LUNAFAST_PKG $_op allow ---"
+		run_adb -s "$LUNAFAST_S" shell appops set "$LUNAFAST_PKG" "$_op" allow 2>&1 || true
+	done
+	printf '%s\n' "--- итог выдачи разрешений: pm grant попыток=$_n, без явной ошибки=$_ok, с ошибкой=$_fail ---"
+}
 ec=0
 : "${LUNAFAST_S:?}" "${LUNAFAST_RMT:?}" "${LUNAFAST_EC_FILE:?}"
 printf '%s\n' "########################################"
 printf '%s\n' "# serial: $LUNAFAST_S (pm после push)"
 printf '%s\n' "########################################"
+lunafast_runner_session_connect
 printf '%s\n' "--- adb get-state ---"
 run_adb -s "$LUNAFAST_S" get-state 2>&1 || true
 if [ -n "${LUNAFAST_PKG:-}" ]; then
@@ -700,6 +981,7 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 	run_adb -s "$LUNAFAST_S" shell pm list packages -f 2>&1 | grep -F "$LUNAFAST_PKG" || printf '%s\n' "(пакет не в list — см. выше)"
 	printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 	run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+	lunafast_runner_grant_all_permissions
 	printf '%s\n' "--- проверка запущенности: $LUNAFAST_PKG ---"
 	printf '%s\n' "--- shell pidof ---"
 	_po=$(run_adb -s "$LUNAFAST_S" shell pidof "$LUNAFAST_PKG" 2>&1 || true)
@@ -719,6 +1001,7 @@ elif [ "$ec" -eq 0 ]; then
 else
 	printf '%s\n' "ОШИБКА установки — см. вывод adb выше."
 fi
+lunafast_runner_session_disconnect
 printf '%s\n' ""
 printf '%s\n' "$ec" >"$LUNAFAST_EC_FILE"
 exit "$ec"
@@ -741,11 +1024,62 @@ run_adb() {
 		adb "$@"
 	fi
 }
+lunafast_runner_session_connect() {
+	case "$LUNAFAST_S" in
+	*:*)
+		printf '%s\n' "--- adb connect $LUNAFAST_S ---"
+		_co=$(adb connect "$LUNAFAST_S" 2>&1) || true
+		printf '%s\n' "$_co"
+		;;
+	esac
+}
+lunafast_runner_session_disconnect() {
+	case "$LUNAFAST_S" in
+	*:*)
+		printf '%s\n' "--- adb disconnect $LUNAFAST_S ---"
+		_do=$(adb disconnect "$LUNAFAST_S" 2>&1) || true
+		printf '%s\n' "$_do"
+		;;
+	esac
+}
+lunafast_runner_grant_all_permissions() {
+	[ -z "${LUNAFAST_PKG:-}" ] && return 0
+	printf '%s\n' "--- выдача всех разрешений: $LUNAFAST_PKG ---"
+	printf '%s\n' "--- pm grant --all-permissions (Android 15+) ---"
+	run_adb -s "$LUNAFAST_S" shell pm grant --all-permissions "$LUNAFAST_PKG" 2>&1 || true
+	_dump=$(run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>/dev/null) || _dump=
+	_tf=$(mktemp) || return 0
+	: >"$_tf"
+	printf '%s\n' "$_dump" | grep -oE 'android\.permission\.[A-Za-z0-9_.]+: granted=false' \
+		| sed 's/: granted=false//' >>"$_tf" 2>/dev/null || true
+	printf '%s\n' "$_dump" | sed -n '/requested permissions:/,/install permissions:/p' 2>/dev/null \
+		| grep -oE 'android\.permission\.[A-Za-z0-9_.]+' >>"$_tf" 2>/dev/null || true
+	sort -u "$_tf" -o "$_tf" 2>/dev/null || true
+	_n=0 _ok=0 _fail=0
+	while read -r _perm || [ -n "$_perm" ]; do
+		[ -z "$_perm" ] && continue
+		_n=$((_n + 1))
+		printf '%s\n' "--- pm grant $LUNAFAST_PKG $_perm ---"
+		_gr=$(run_adb -s "$LUNAFAST_S" shell pm grant "$LUNAFAST_PKG" "$_perm" 2>&1) || _gr=
+		printf '%s\n' "$_gr"
+		case "$_gr" in
+		*Exception* | *Error* | *error* | *denied* | *Unknown*) _fail=$((_fail + 1)) ;;
+		*) _ok=$((_ok + 1)) ;;
+		esac
+	done <"$_tf"
+	rm -f "$_tf"
+	for _op in REQUEST_INSTALL_PACKAGES SYSTEM_ALERT_WINDOW GET_USAGE_STATS WRITE_SETTINGS MANAGE_EXTERNAL_STORAGE; do
+		printf '%s\n' "--- appops set $LUNAFAST_PKG $_op allow ---"
+		run_adb -s "$LUNAFAST_S" shell appops set "$LUNAFAST_PKG" "$_op" allow 2>&1 || true
+	done
+	printf '%s\n' "--- итог выдачи разрешений: pm grant попыток=$_n, без явной ошибки=$_ok, с ошибкой=$_fail ---"
+}
 ec=0
 : "${LUNAFAST_S:?}" "${LUNAFAST_OLIST:?}" "${LUNAFAST_EC_FILE:?}"
 printf '%s\n' "########################################"
 printf '%s\n' "# serial: $LUNAFAST_S"
 printf '%s\n' "########################################"
+lunafast_runner_session_connect
 printf '%s\n' "--- adb get-state ---"
 run_adb -s "$LUNAFAST_S" get-state 2>&1 || true
 printf '%s\n' "--- adb shell echo ping ---"
@@ -782,6 +1116,7 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 	run_adb -s "$LUNAFAST_S" shell pm list packages -f 2>&1 | grep -F "$LUNAFAST_PKG" || printf '%s\n' "(пакет не в list)"
 	printf '%s\n' "--- версия (dumpsys, фрагмент) ---"
 	run_adb -s "$LUNAFAST_S" shell dumpsys package "$LUNAFAST_PKG" 2>&1 | grep -E 'versionName|versionCode|firstInstallTime|lastUpdateTime' | head -10 || true
+	lunafast_runner_grant_all_permissions
 	printf '%s\n' "--- проверка запущенности: $LUNAFAST_PKG ---"
 	printf '%s\n' "--- shell pidof ---"
 	_po=$(run_adb -s "$LUNAFAST_S" shell pidof "$LUNAFAST_PKG" 2>&1 || true)
@@ -799,6 +1134,7 @@ if [ "$ec" -eq 0 ] && [ -n "${LUNAFAST_PKG:-}" ]; then
 elif [ "$ec" -ne 0 ]; then
 	printf '%s\n' "ОШИБКА установки — см. вывод adb выше."
 fi
+lunafast_runner_session_disconnect
 printf '%s\n' ""
 printf '%s\n' "$ec" >"$LUNAFAST_EC_FILE"
 exit "$ec"
@@ -1447,23 +1783,25 @@ install_xapk_to_serials_logged() {
 	gm=0
 	[ -n "$LUNAFAST_DIALOG_LIVE" ] && lunafast_dialog_has_gauge && gm=1
 	err=0
+	export LUNAFAST_ADB_LOG="$log"
 	while read -r raw || [ -n "$raw" ]; do
 		s=$(serial_clean "$raw")
 		[ -z "$s" ] && continue
 		runner=$(mktemp) || {
+			unset LUNAFAST_ADB_LOG
 			rm -f "$olist"
 			rm -rf "$td"
 			return 1
 		}
+		{
+			printf '%s\n' "########################################"
+			printf '%s\n' "# serial: $s — установка XAPK"
+			printf '%s\n' "########################################"
+		} >>"$log"
 		export LUNAFAST_S="$s" LUNAFAST_PKG="$pkg"
 		if [ "$napk" -eq 1 ]; then
 			if [ "$gm" -eq 1 ]; then
 				rmt="/data/local/tmp/lunafast_inst_$$.apk"
-				{
-					printf '%s\n' "########################################"
-					printf '%s\n' "# serial: $s (один APK из XAPK)"
-					printf '%s\n' "########################################"
-				} >>"$log"
 				if ! lunafast_dialog_gauge_apk_install "$s" "$first" "$rmt" "$log" "$pkg"; then
 					rm -f "$runner"
 					err=1
@@ -1484,6 +1822,7 @@ install_xapk_to_serials_logged() {
 		rm -f "$runner"
 		[ "$ec" -ne 0 ] && err=1
 	done <"$serials_file"
+	unset LUNAFAST_ADB_LOG
 	rm -f "$olist"
 	rm -rf "$td"
 	return "$err"
@@ -1532,17 +1871,21 @@ install_apk_to_serials_logged() {
 	gm=0
 	[ -n "$LUNAFAST_DIALOG_LIVE" ] && lunafast_dialog_has_gauge && gm=1
 	err=0
+	export LUNAFAST_ADB_LOG="$log"
 	while read -r raw || [ -n "$raw" ]; do
 		s=$(serial_clean "$raw")
 		[ -z "$s" ] && continue
-		runner=$(mktemp) || return 1
+		runner=$(mktemp) || {
+			unset LUNAFAST_ADB_LOG
+			return 1
+		}
+		{
+			printf '%s\n' "########################################"
+			printf '%s\n' "# serial: $s — установка APK"
+			printf '%s\n' "########################################"
+		} >>"$log"
 		if [ "$gm" -eq 1 ]; then
 			rmt="/data/local/tmp/lunafast_inst_$$.apk"
-			{
-				printf '%s\n' "########################################"
-				printf '%s\n' "# serial: $s"
-				printf '%s\n' "########################################"
-			} >>"$log"
 			if ! lunafast_dialog_gauge_apk_install "$s" "$abs" "$rmt" "$log" "$pkg"; then
 				rm -f "$runner"
 				err=1
@@ -1559,6 +1902,7 @@ install_apk_to_serials_logged() {
 		rm -f "$runner"
 		[ "$ec" -ne 0 ] && err=1
 	done <"$serials_file"
+	unset LUNAFAST_ADB_LOG
 	return "$err"
 }
 
@@ -1639,25 +1983,19 @@ lunafast_health_probe_explain() {
 	return 2
 }
 
-# Отчёт в файл $_f по всем device: serial TAB ОК|НЕ ОК TAB деталь
-lunafast_write_health_report_to() {
+# Отчёт health по serial из файла целей (по одному в строке): serial TAB ОК|НЕ ОК TAB деталь
+lunafast_write_health_report_targets() {
 	_f=$1
+	_tgts=$2
 	load_settings
-	ensure_adb
-	sf=$(mktemp) || return 1
-	: >"$_f" || {
-		rm -f "$sf"
-		return 1
-	}
-	refresh_serials_file "$sf"
+	: >"$_f" || return 1
 	_tp=0
 	{
-		printf '%s\n' "=== HTTP :${HEALTH_PORT}${HEALTH_PATH} — host из adb serial (часть до «:») ==="
+		printf '%s\n' "=== HTTP :${HEALTH_PORT}${HEALTH_PATH} — по списку целей (host из serial) ==="
 		printf '%s\n' ""
 	} >>"$_f"
-	if [ ! -s "$sf" ]; then
-		printf '%s\n' "(нет подключённых device)" >>"$_f"
-		rm -f "$sf"
+	if [ ! -s "$_tgts" ]; then
+		printf '%s\n' "(список целей пуст — сначала «Выбор устройств» в Прошивка)" >>"$_f"
 		return 0
 	fi
 	while read -r raw || [ -n "$raw" ]; do
@@ -1679,8 +2017,7 @@ lunafast_write_health_report_to() {
 			;;
 		*) printf '%s\tНЕ ОК\t%s — %s\n' "$_s" "$_url" "$_expl" >>"$_f" ;;
 		esac
-	done <"$sf"
-	rm -f "$sf"
+	done <"$_tgts"
 	return "$_tp"
 }
 
@@ -1771,6 +2108,7 @@ lunafast_launch_pkg_on_serials() {
 	_any=1
 	_err=0
 	: >"$_out"
+	export LUNAFAST_ADB_LOG="$_out"
 	while read -r _s; do
 		[ -z "$_s" ] && continue
 		_any=0
@@ -1783,6 +2121,7 @@ lunafast_launch_pkg_on_serials() {
 			printf '%s\n' ""
 		} >>"$_out"
 	done <"$_serf"
+	unset LUNAFAST_ADB_LOG
 	[ "$_any" -eq 1 ] && return 1
 	return "$_err"
 }
@@ -1893,12 +2232,14 @@ lunafast_launcher_apply_serials_logged() {
 	_log=$3
 	_err=0
 	_any=1
+	export LUNAFAST_ADB_LOG="$_log"
 	while read -r raw || [ -n "$raw" ]; do
 		_s=$(serial_clean "$raw")
 		[ -z "$_s" ] && continue
 		_any=0
 		lunafast_launcher_apply_one_to_log "$_s" "$_pkg" "$_log" || _err=1
 	done <"$_serf"
+	unset LUNAFAST_ADB_LOG
 	[ "$_any" -eq 1 ] && return 1
 	return "$_err"
 }
@@ -2020,12 +2361,16 @@ pick_serials_to_file() {
 	[ -s "$outf" ] || return 1
 }
 
-# ─── Поиск (ядро) ───
+# ─── Поиск (ядро): найти онлайн → записать scanned_devices → отключить от adb ───
 run_scan_connect() {
 	load_settings
+	ensure_adb
 	sub=$(printf '%s' "$SCAN_SUBNET" | sed 's/\.$//')
 	p="$ADB_PORT"
 	found=$(mktemp) || exit 1
+	scanned=$(scanned_targets_file)
+	mkdir -p "$(dirname "$scanned")" 2>/dev/null || true
+	: >"$scanned"
 	if command -v nc >/dev/null 2>&1; then
 		i=1
 		while [ "$i" -le 254 ]; do
@@ -2036,18 +2381,47 @@ run_scan_connect() {
 		i=1
 		while [ "$i" -le 254 ]; do
 			ip="${sub}.${i}"
-			o=$(adb connect "${ip}:${p}" 2>&1) || true
-			case "$o" in *connected* | *already*) printf '%s\n' "$ip" >>"$found" ;; esac
+			ser="${ip}:${p}"
+			o=$(adb connect "$ser" 2>&1) || true
+			case "$o" in
+			*connected* | *already*)
+				if adb devices 2>/dev/null | awk -v s="$ser" '$1==s && $2=="device" { ok=1 } END { exit !ok }'; then
+					printf '%s\n' "$ser" >>"$scanned"
+				fi
+				;;
+			esac
 			i=$((i + 1))
 		done
+		rm -f "$found"
+		if [ -s "$scanned" ]; then
+			while read -r _ser || [ -n "$_ser" ]; do
+				[ -z "$_ser" ] && continue
+				adb disconnect "$_ser" 2>/dev/null || true
+			done <"$scanned"
+		fi
+		return 0
 	fi
 	if [ -s "$found" ]; then
 		while read -r ip; do
 			[ -z "$ip" ] && continue
-			adb connect "${ip}:${p}" || true
+			ser="${ip}:${p}"
+			o=$(adb connect "$ser" 2>&1) || true
+			case "$o" in
+			*connected* | *already*)
+				if adb devices 2>/dev/null | awk -v s="$ser" '$1==s && $2=="device" { ok=1 } END { exit !ok }'; then
+					printf '%s\n' "$ser" >>"$scanned"
+				fi
+				;;
+			esac
 		done <"$found"
 	fi
 	rm -f "$found"
+	if [ -s "$scanned" ]; then
+		while read -r _ser || [ -n "$_ser" ]; do
+			[ -z "$_ser" ] && continue
+			adb disconnect "$_ser" 2>/dev/null || true
+		done <"$scanned"
+	fi
 }
 
 # ═══════════════ dialog UI ═══════════════
@@ -2067,14 +2441,13 @@ dialog_main() {
 		c=$(dialog --stdout --clear --colors \
 			--default-item "$mddef" \
 			--title "[ lunafast-fw-upload ] ─ Главное меню" \
-			--menu "Порт: $ADB_PORT  │  Подсеть: ${SCAN_SUBNET}.x  │  health: :${HEALTH_PORT}${HEALTH_PATH}\nЖурнал: lunafast_install.log (новые записи в начале файла) · п.5\n\n↑↓ выбор · Enter — раздел · Esc — выход." 26 82 10 \
-			1 "Сеть › поиск устройств (скан LAN)" \
-			2 "Прошивка › вложенное меню (цели, APK/XAPK…)" \
+			--menu "Порт: $ADB_PORT  │  Подсеть: ${SCAN_SUBNET}.x\nЖурнал: lunafast_install.log (новые записи в начале файла) · п.5\n\n↑↓ выбор · Enter — раздел · Esc — выход." 24 82 9 \
+			1 "Сеть › поиск устройств (скан LAN → список, adb disconnect)" \
+			2 "Прошивка › вложенное меню (цели, APK/XAPK, health…)" \
 			3 "Настройки" \
 			4 "Просмотр: adb devices -l" \
 			5 "Журнал установок (сверху — последняя операция)" \
 			6 "Перезагрузка: выбрать device (adb reboot)" \
-			7 "Health: GET :${HEALTH_PORT}${HEALTH_PATH} по IP из serial (ОК / НЕ ОК)" \
 			0 "Выход")
 		ex=$?
 		[ "$ex" -eq 255 ] || [ "$ex" -eq 1 ] && break
@@ -2090,7 +2463,6 @@ dialog_main() {
 			;;
 		5) dialog_show_project_log ;;
 		6) dialog_reboot_device ;;
-		7) dialog_healthcheck_devices ;;
 		0) break ;;
 		esac
 	done
@@ -2107,8 +2479,12 @@ dialog_search_flow() {
 		run_scan_connect
 		_tf=$(mktemp)
 		adb devices -l >"$_tf"
+		_sc=$(scanned_targets_file)
+		_sn=0
+		[ -s "$_sc" ] && _sn=$(wc -l <"$_sc" | tr -d ' ')
 		dialog --title "[ Сеть › результат ]" --textbox "$_tf" 22 78
 		rm -f "$_tf"
+		dialog --msgbox "Найдено и сохранено в scanned_devices: ${_sn:-0} шт.\nВсе отключены от adb (disconnect).\n\nДля прошивки: Прошивка › выбор устройств (проверка связи)." 11 72
 		a=$(dialog --stdout --title "[ Сеть › дальше ]" --menu "Действие после поиска:" 16 72 4 \
 			1 "Прошивка › установить APK (мастер)" \
 			2 "Повторить поиск" \
@@ -2135,6 +2511,7 @@ HTTP-действия вынесены в отдельный подпункт." 
 			6 "Запуск приложения на сохранённом списке (adb am start …)" \
 			7 "HTTP API операции (КриптоПро / заставка / click-area / light)" \
 			8 "Сделать launcher: отключить штатный → HOME-приложение" \
+			9 "Health: GET :${HEALTH_PORT}${HEALTH_PATH} по сохранённому списку" \
 			0 "◀ Назад в главное меню") || break
 		case "$b" in
 		1) dialog_install_wizard ;;
@@ -2145,6 +2522,7 @@ HTTP-действия вынесены в отдельный подпункт." 
 		6) dialog_launch_app_saved ;;
 		7) dialog_http_actions_menu ;;
 		8) dialog_launcher_saved ;;
+		9) dialog_healthcheck_saved ;;
 		0) break ;;
 		esac
 	done
@@ -2178,18 +2556,27 @@ dialog_connect_ip() {
 		dialog --msgbox "Нужен формат host:port" 6 40
 		return
 	}
-	adb connect "$addr"
-	dialog --msgbox "Команда выполнена. Проверьте список в главном меню (п.4)." 7 60
+	if lunafast_adb_connect_serial "$addr"; then
+		lunafast_adb_disconnect_serial "$addr"
+		dialog --msgbox "Связь есть. Устройство снова отключено от adb (disconnect).\n\nДальше: Прошивка › выбор устройств." 9 72
+	else
+		dialog --msgbox "Нет связи с $addr (connect/get-state)." 7 60
+	fi
 }
 
 dialog_flash_checklist() {
 	load_settings
 	ensure_adb
-	sf=$(mktemp)
-	refresh_serials_file "$sf"
-	if [ ! -s "$sf" ]; then
-		dialog --msgbox "Нет устройств в состоянии device." 6 50
+	_sc=$(scanned_targets_file)
+	if [ ! -s "$_sc" ]; then
+		dialog --msgbox "Сначала: Главное меню › Сеть › поиск устройств (скан LAN)." 8 62
+		return
+	fi
+	dialog --title "[ Прошивка › выбор целей ]" --infobox "Проверка связи с найденными устройствами…" 5 60
+	sf=$(mktemp) || return 1
+	if ! lunafast_adb_refresh_verified_file "$_sc" "$sf"; then
 		rm -f "$sf"
+		dialog --msgbox "Нет устройств с рабочей связью.\nПовторите поиск в Сеть или проверьте ADB на планшетах." 9 72
 		return
 	fi
 	n=$(wc -l <"$sf" | tr -d ' ')
@@ -2205,23 +2592,34 @@ dialog_flash_checklist() {
 	done <"$sf"
 	sel=$(dialog --stdout --separate-output \
 		--title "[ Прошивка › выбор целей ]" \
-		--checklist "Пробел — отметить / снять. Enter — OK." "$h" 78 "$lh" $args) || {
+		--checklist "Только устройства с связью. Пробел — отметить. Enter — OK." "$h" 78 "$lh" $args) || {
 		rm -f "$sf"
 		return
 	}
 	out=$(selected_targets_file)
 	mkdir -p "$(dirname "$out")"
 	: >"$out"
+	_skip=0
 	for t in $sel; do
-		sed -n "${t}p" "$sf" >>"$out"
+		_cand=$(sed -n "${t}p" "$sf")
+		[ -z "$_cand" ] && continue
+		if lunafast_adb_verify_serial "$_cand"; then
+			printf '%s\n' "$_cand" >>"$out"
+		else
+			_skip=$((_skip + 1))
+		fi
 	done
 	rm -f "$sf"
 	nc=$(wc -l <"$out" | tr -d ' ')
 	if [ "${nc:-0}" -eq 0 ]; then
-		dialog --msgbox "Ничего не отмечено." 5 40
+		dialog --msgbox "Ничего не сохранено (нет связи или не отмечено)." 6 52
 		return
 	fi
-	dialog --msgbox "Сохранено устройств: $nc\nДалее можно запускать установку APK/XAPK или HTTP-действия (КриптоПро, заставка, click-area, light)." 10 74
+	if [ "$_skip" -gt 0 ]; then
+		dialog --msgbox "Сохранено: $nc\nПропущено (нет связи при повторной проверке): $_skip" 8 72
+	else
+		dialog --msgbox "Сохранено устройств: $nc\nДалее: установка APK/XAPK или HTTP-действия." 9 74
+	fi
 }
 
 dialog_show_saved() {
@@ -2273,9 +2671,19 @@ dialog_reboot_device() {
 	rm -f "$sf"
 	[ -z "$ser" ] && return
 	dialog --yesno "Отправить «adb -s … reboot» на устройство?\n\n$ser" 9 72 || return
+	if ! lunafast_adb_verify_serial "$ser"; then
+		dialog --msgbox "Нет связи с устройством.\n$ser" 7 60
+		return
+	fi
 	ec=0
 	out=$(mktemp)
-	adb -s "$ser" reboot >>"$out" 2>&1 || ec=$?
+	export LUNAFAST_ADB_LOG="$out"
+	lunafast_adb_connect_serial "$ser" || ec=1
+	if [ "$ec" -eq 0 ]; then
+		adb -s "$ser" reboot >>"$out" 2>&1 || ec=$?
+	fi
+	lunafast_adb_disconnect_serial "$ser"
+	unset LUNAFAST_ADB_LOG
 	if [ "$ec" -eq 0 ]; then
 		dialog --msgbox "Команда отправлена.\n\n$ser\n\n(устройство должно перезагрузиться)" 10 72
 	else
@@ -2284,16 +2692,20 @@ dialog_reboot_device() {
 	rm -f "$out"
 }
 
-dialog_healthcheck_devices() {
+dialog_healthcheck_saved() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		dialog --msgbox "Сначала: Прошивка › п.3 — выбор устройств (сохранённый список целей)." 8 62
+		return
+	fi
 	load_settings
-	ensure_adb
 	rep=$(mktemp) || {
 		dialog --msgbox "Не удалось создать временный файл отчёта." 6 55
 		return 1
 	}
-	lunafast_write_health_report_to "$rep"
+	lunafast_write_health_report_targets "$rep" "$f"
 	_hr=$?
-	dialog --title "[ health GET :${HEALTH_PORT}${HEALTH_PATH} ]" --cr-wrap --textbox "$rep" 22 94
+	dialog --title "[ health GET :${HEALTH_PORT}${HEALTH_PATH} · список целей ]" --cr-wrap --textbox "$rep" 22 94
 	rm -f "$rep"
 	if [ "$_hr" -ne 0 ]; then
 		dialog --msgbox "Замечание: на этой машине нет curl и wget для проверки HTTP (или сбой записи)." 10 72
@@ -2627,13 +3039,28 @@ dialog_light_saved() {
 dialog_install_wizard() {
 	load_settings
 	ensure_adb
-	addr=$(dialog --stdout --title "[ Мастер ]" --inputbox "ADB IP:PORT [пусто — пропуск]:" 10 70 "") || return
+	addr=$(dialog --stdout --title "[ Мастер ]" --inputbox "ADB IP:PORT [пусто — из списка после скана]:" 10 70 "") || return
 	if [ -n "$addr" ] && is_adb_target "$addr"; then
-		adb connect "$addr" || true
+		if lunafast_adb_connect_serial "$addr"; then
+			lunafast_adb_disconnect_serial "$addr"
+		else
+			dialog --msgbox "Нет связи: $addr" 6 45
+			return
+		fi
 	fi
 	ap=$(dialog_pick_install_package "[ Мастер › пакет ]") || return
+	_sc=$(scanned_targets_file)
 	sf=$(mktemp)
-	refresh_serials_file "$sf"
+	if [ -s "$_sc" ]; then
+		dialog --title "[ Мастер ]" --infobox "Проверка связи с найденными устройствами…" 5 55
+		if ! lunafast_adb_refresh_verified_file "$_sc" "$sf"; then
+			rm -f "$sf"
+			dialog --msgbox "Нет устройств с связью. Сначала Сеть › поиск." 8 60
+			return
+		fi
+	else
+		refresh_serials_file "$sf"
+	fi
 	if [ ! -s "$sf" ]; then
 		rm -f "$sf"
 		dialog --msgbox "Нет device." 5 35
@@ -2658,15 +3085,23 @@ dialog_install_wizard() {
 	}
 	p=$(mktemp)
 	: >"$p"
+	_skip=0
 	for t in $selmust; do
-		sed -n "${t}p" "$sf" >>"$p"
+		_cand=$(sed -n "${t}p" "$sf")
+		[ -z "$_cand" ] && continue
+		if lunafast_adb_verify_serial "$_cand"; then
+			printf '%s\n' "$_cand" >>"$p"
+		else
+			_skip=$((_skip + 1))
+		fi
 	done
 	rm -f "$sf"
 	[ ! -s "$p" ] && {
 		rm -f "$p"
-		dialog --msgbox "Не выбрано ни одного." 5 40
+		dialog --msgbox "Не выбрано ни одного (или нет связи)." 6 50
 		return
 	}
+	[ "$_skip" -gt 0 ] && dialog --msgbox "Пропущено без связи: $_skip" 6 40
 	dialog --yesno "Подтвердить установку?" 6 50 || {
 		rm -f "$p"
 		return
@@ -2809,10 +3244,12 @@ text_flash_menu_txt() {
 '
 		printf '│  8) Сделать launcher (штатный → HOME-приложение)         │
 '
+		printf '│  9) Health: GET :%s%s по сохранённому списку              │
+' "${HEALTH_PORT}" "${HEALTH_PATH}"
 		printf '│  0) ◀ Назад                                              │
 '
 		text_hline_bot 58
-		printf '%s' "Выбор [0-8]: "
+		printf '%s' "Выбор [0-9]: "
 		read -r b || return
 		case "$b" in
 		1) menu_install_text ;;
@@ -2832,6 +3269,7 @@ text_flash_menu_txt() {
 		6) text_launch_saved_txt ;;
 		7) text_http_actions_menu_txt ;;
 		8) text_launcher_saved_txt ;;
+		9) text_healthcheck_saved_txt ;;
 		0) break ;;
 		esac
 	done
@@ -3296,11 +3734,18 @@ text_launch_saved_txt() {
 
 text_flash_checklist_txt() {
 	load_settings
-	sf=$(mktemp)
-	refresh_serials_file "$sf"
-	if [ ! -s "$sf" ]; then
-		printf '%s\n' "Нет device."
+	ensure_adb
+	_sc=$(scanned_targets_file)
+	if [ ! -s "$_sc" ]; then
+		printf '%s\n' "Сначала п.1 Сеть › поиск."
+		read -r _
+		return
+	fi
+	printf '%s\n' "Проверка связи…"
+	sf=$(mktemp) || return 1
+	if ! lunafast_adb_refresh_verified_file "$_sc" "$sf"; then
 		rm -f "$sf"
+		printf '%s\n' "Нет устройств с связью."
 		read -r _
 		return
 	fi
@@ -3319,9 +3764,19 @@ text_flash_checklist_txt() {
 		read -r _
 		return
 	fi
-	mv "$p" "$out"
-	rm -f "$sf"
-	printf '%s\n' "Сохранено в $out — далее установка APK/XAPK или HTTP-действия (КриптоПро, заставка, click-area, light)."
+	: >"$out"
+	_skip=0
+	while read -r _cand || [ -n "$_cand" ]; do
+		[ -z "$_cand" ] && continue
+		if lunafast_adb_verify_serial "$_cand"; then
+			printf '%s\n' "$_cand" >>"$out"
+		else
+			_skip=$((_skip + 1))
+		fi
+	done <"$p"
+	rm -f "$sf" "$p"
+	[ "$_skip" -gt 0 ] && printf '%s\n' "Пропущено без связи: $_skip"
+	printf '%s\n' "Сохранено в $out"
 	read -r _
 }
 
@@ -3496,17 +3951,22 @@ menu_settings_text() {
 	read -r _
 }
 
-text_healthcheck_devices_txt() {
+text_healthcheck_saved_txt() {
+	f=$(selected_targets_file)
+	if [ ! -s "$f" ]; then
+		printf '%s\n' "Сначала п.3 — выбор устройств (список целей)."
+		read -r _
+		return
+	fi
 	load_settings
-	ensure_adb
 	rep=$(mktemp) || {
 		printf '%s\n' "Не удалось создать временный файл отчёта."
 		read -r _
 		return 1
 	}
-	lunafast_write_health_report_to "$rep"
+	lunafast_write_health_report_targets "$rep" "$f"
 	_h=$?
-	printf '%s\n' "--- Отчёт (serial / статус / URL или причина) ---"
+	printf '%s\n' "--- Health по списку целей (serial / статус / URL) ---"
 	cat "$rep"
 	rm -f "$rep"
 	[ "$_h" -ne 0 ] && printf '%s\n' "--- Замечание: нет curl и wget или ошибка записи ---"
@@ -3517,6 +3977,10 @@ text_search_flow() {
 	load_settings
 	printf '%s\n' "… скан …"
 	run_scan_connect
+	_sc=$(scanned_targets_file)
+	_sn=0
+	[ -s "$_sc" ] && _sn=$(wc -l <"$_sc" | tr -d ' ')
+	printf '%s\n' "Сохранено в scanned_devices: ${_sn:-0} (adb disconnect выполнен)"
 	adb devices -l
 	while true; do
 		printf '%s\n' "  1) Мастер прошивки  2) Повтор  0) Назад"
@@ -3545,11 +4009,10 @@ text_main() {
 		printf '│  4) adb devices -l                                     │\n'
 		printf '│  5) Журнал установок (lunafast_install.log)             │\n'
 		printf '│  6) Перезагрузка device (adb reboot)                      │\n'
-		printf '│  7) Health: GET по настройке (:${HEALTH_PORT}${HEALTH_PATH}) — ОК/НЕ ОК     │\n'
 		printf '│  0) Выход                                              │\n'
 		text_hline_bot 58
 		adb devices -l
-		printf '%s' "[0-7]: "
+		printf '%s' "[0-6]: "
 		read -r c || exit 0
 		case "$c" in
 		1) text_search_flow ;;
@@ -3574,7 +4037,6 @@ text_main() {
 			read -r _
 			;;
 		6) text_reboot_device_txt ;;
-		7) text_healthcheck_devices_txt ;;
 		0) exit 0 ;;
 		esac
 	done

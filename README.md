@@ -24,7 +24,10 @@ sudo apt install dialog   # Debian/Ubuntu
     - заставка (`POST /screensaver`);
     - кликабельная зона (`POST /click-area`);
     - подсветка (`POST /light`, payload `{"command":"on","light_level":X}`);
-  - **п.8** — **launcher**: `pm disable-user` штатных launcher → `cmd role` HOME для `ai.visionlabs.transactionapp`, `ai.visionlabs.lunafast2nextgen` или своего package.
+  - **п.8** — **launcher**: `pm disable-user` штатных launcher → `cmd role` HOME для `ai.visionlabs.transactionapp`, `ai.visionlabs.lunafast2nextgen` или своего package;
+  - **п.9** — **healthcheck** по сохранённому списку целей (`GET :HEALTH_PORT/HEALTH_PATH`).
+
+После **Сеть › поиск** устройства записываются в `scanned_devices` и отключаются от adb; при **выборе целей** связь проверяется заново (без связи — не сохранить).
 
 ## Запуск
 
