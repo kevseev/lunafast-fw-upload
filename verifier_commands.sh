@@ -125,16 +125,16 @@ get_client_info() {
 }
 
 generate_consent() {
-  # Поле oid в теле обязательно для валидации, на результат не влияет.
-  # Берём текущий OID из меню, без отдельного диалога.
-  local oid="${OID:-0}"
+  # oid и redirect_url — заглушки для валидации тела запроса
+  local oid="${CONSENT_OID_STUB:-1000723725}"
+  local redirect_url="${CONSENT_REDIRECT_URL:-https://visionlabs.ru}"
 
   curl -sS --location \
     "${BASE_URL}/api/v1/generate-consent" \
     --header "trace-id: ${TRACE_ID}" \
     --header "Content-Type: application/json" \
     --header "X-API-KEY: ${VERIFIER_X_API_KEY}" \
-    --data "{\"oid\": \"${oid}\"}"
+    --data "{\"oid\": \"${oid}\", \"redirect_url\": \"${redirect_url}\"}"
 
   echo
 }
