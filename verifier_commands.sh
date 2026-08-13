@@ -8,6 +8,10 @@ VERIFIER_X_API_KEY="${VERIFIER_X_API_KEY:-demo}"
 VERIFIER_HOST="${VERIFIER_HOST:-localhost}"
 VERIFIER_PORT="${VERIFIER_PORT:-9300}"
 OID="${OID:-}"
+VERIFIER_CONTAINER="${VERIFIER_CONTAINER:-verifier-verifier-1-1}"
+REG_LOG_WAIT_SEC="${REG_LOG_WAIT_SEC:-60}"
+REG_LOG_POLL_SEC="${REG_LOG_POLL_SEC:-2}"
+REG_LOG_TAIL="${REG_LOG_TAIL:-500}"
 
 BASE_URL="http://${VERIFIER_HOST}:${VERIFIER_PORT}"
 
@@ -31,22 +35,78 @@ ask_oid() {
   fi
 }
 
+# Ищем в docker logs callback регистрации для oid.
+# Пример:
+#   Registration callback parsed: success=True, status=MA, person_id=None, oid=239846666
+wait_registration_result() {
+  local oid="$1"
+  local deadline=$((SECONDS + REG_LOG_WAIT_SEC))
+  local line=""
+  local status=""
+
+  echo "Жду Registration callback в логах ${VERIFIER_CONTAINER} (до ${REG_LOG_WAIT_SEC}с)..."
+
+  while (( SECONDS < deadline )); do
+    line="$(
+      docker logs -n "${REG_LOG_TAIL}" "${VERIFIER_CONTAINER}" 2>&1 \
+        | grep "Registration callback parsed:" \
+        | grep "oid=${oid}" \
+        | tail -n 1 || true
+    )"
+
+    if [[ -n "${line}" ]]; then
+      echo
+      echo "Лог:"
+      echo "  ${line}"
+
+      status="$(
+        printf '%s' "${line}" \
+          | sed -n 's/.*status=\([^,[:space:]]*\).*/\1/p'
+      )"
+
+      case "${status}" in
+        MA)
+          echo "Результат: МА — персона есть (matching)."
+          return 0
+          ;;
+        MF)
+          echo "Результат: МF — персоны нет (not matching)."
+          return 0
+          ;;
+        *)
+          echo "Результат: status=${status:-?} (не разобрал MA/MF)."
+          return 0
+          ;;
+      esac
+    fi
+
+    sleep "${REG_LOG_POLL_SEC}"
+  done
+
+  echo "Таймаут: callback для oid=${oid} не найден в ${VERIFIER_CONTAINER}." >&2
+  echo "Проверь вручную:" >&2
+  echo "  docker logs -n ${REG_LOG_TAIL} ${VERIFIER_CONTAINER} 2>&1 | grep ${oid}" >&2
+  return 1
+}
+
 registration_without_bo() {
   local oid="${1:-$OID}"
   OID="$oid"
+  local http_body=""
 
-  curl -sS -X POST \
-    "${BASE_URL}/api/v1/registration" \
-    --header "trace-id: ${TRACE_ID}" \
-    --header "accept: application/json" \
-    --header "X-API-KEY: ${VERIFIER_X_API_KEY}" \
-    --header "Content-Type: application/json" \
-    --data "{\"user_id\": \"${oid}\"}"
+  http_body="$(
+    curl -sS -X POST \
+      "${BASE_URL}/api/v1/registration" \
+      --header "trace-id: ${TRACE_ID}" \
+      --header "accept: application/json" \
+      --header "X-API-KEY: ${VERIFIER_X_API_KEY}" \
+      --header "Content-Type: application/json" \
+      --data "{\"user_id\": \"${oid}\"}"
+  )"
 
+  echo "${http_body}"
   echo
-  echo "Проверь логи MATCHING:"
-  echo "  Person was matching ... userId: ${oid}   # МА"
-  echo "  Person was not matching ... userId: ${oid} # МF"
+  wait_registration_result "${oid}"
 }
 
 get_client_info() {
@@ -82,8 +142,9 @@ print_menu() {
 ==============================
  Verifier  ${VERIFIER_HOST}:${VERIFIER_PORT}
  TRACE_ID=${TRACE_ID}  OID=${OID:-<не задан>}
+ container=${VERIFIER_CONTAINER}
 ==============================
-  1) Регистрация без БО
+  1) Регистрация без БО (+ проверка логов)
   2) Получение ЦП
   3) Выдача согласия
   0) Выход   (также: q / exit / quit)
@@ -105,7 +166,7 @@ run_menu() {
       1)
         ask_oid || continue
         echo
-        registration_without_bo "${OID}" || echo "Ошибка запроса." >&2
+        registration_without_bo "${OID}" || echo "Ошибка регистрации / проверки логов." >&2
         ;;
       2)
         ask_oid || continue
