@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Verifier helpers: регистрация без БО, получение ЦП, выдача согласия
+# Verifier helpers: меню — регистрация без БО, получение ЦП, выдача согласия
 
-set -euo pipefail
+set -uo pipefail
 
 TRACE_ID="${TRACE_ID:-69dbdf9a}"
 VERIFIER_X_API_KEY="${VERIFIER_X_API_KEY:-demo}"
@@ -11,19 +11,29 @@ OID="${OID:-}"
 
 BASE_URL="http://${VERIFIER_HOST}:${VERIFIER_PORT}"
 
-_require_oid() {
+ask_oid() {
+  local current="${OID}"
+  local input=""
+
+  if [[ -n "${current}" ]]; then
+    read -r -p "OID [${current}]: " input
+  else
+    read -r -p "OID: " input
+  fi
+
+  if [[ -n "${input}" ]]; then
+    OID="${input}"
+  fi
+
   if [[ -z "${OID}" ]]; then
-    echo "OID is empty. Set OID env var or pass it as an argument." >&2
+    echo "OID не задан." >&2
     return 1
   fi
 }
 
-# 1) Регистрация без БО
-# Usage: registration_without_bo [oid]
 registration_without_bo() {
   local oid="${1:-$OID}"
   OID="$oid"
-  _require_oid
 
   curl -sS -X POST \
     "${BASE_URL}/api/v1/registration" \
@@ -34,17 +44,14 @@ registration_without_bo() {
     --data "{\"user_id\": \"${oid}\"}"
 
   echo
-  echo "Check MATCHING logs for:"
+  echo "Проверь логи MATCHING:"
   echo "  Person was matching ... userId: ${oid}   # МА"
   echo "  Person was not matching ... userId: ${oid} # МF"
 }
 
-# 2) Получение ЦП (client-info)
-# Usage: get_client_info [oid]
 get_client_info() {
   local oid="${1:-$OID}"
   OID="$oid"
-  _require_oid
 
   curl -sS -X POST \
     "${BASE_URL}/api/v1/client-info" \
@@ -57,12 +64,9 @@ get_client_info() {
   echo
 }
 
-# 3) Выдача согласия (IDENTIFICATION_EBS_AERO)
-# Usage: generate_consent [oid]
 generate_consent() {
   local oid="${1:-$OID}"
   OID="$oid"
-  _require_oid
 
   curl -sS --location \
     "${BASE_URL}/api/v1/generate-consent" \
@@ -74,39 +78,62 @@ generate_consent() {
   echo
 }
 
-usage() {
+print_menu() {
   cat <<EOF
-Usage:
-  OID=<oid> $0 registration_without_bo
-  OID=<oid> $0 get_client_info
-  OID=<oid> $0 generate_consent
 
-  # or with oid as argument:
-  $0 registration_without_bo <oid>
-  $0 get_client_info <oid>
-  $0 generate_consent <oid>
-
-Env (defaults from verifier docs):
-  TRACE_ID=${TRACE_ID}
-  VERIFIER_X_API_KEY=${VERIFIER_X_API_KEY}
-  VERIFIER_HOST=${VERIFIER_HOST}
-  VERIFIER_PORT=${VERIFIER_PORT}
-  OID=${OID}
+==============================
+ Verifier  ${VERIFIER_HOST}:${VERIFIER_PORT}
+ TRACE_ID=${TRACE_ID}  OID=${OID:-<не задан>}
+==============================
+  1) Регистрация без БО
+  2) Получение ЦП
+  3) Выдача согласия
+  0) Выход   (также: q / exit / quit)
+==============================
 EOF
 }
 
+run_menu() {
+  local choice=""
+
+  while true; do
+    print_menu
+    read -r -p "Выбор: " choice
+    choice="$(printf '%s' "${choice}" | tr '[:upper:]' '[:lower:]')"
+    choice="${choice#"${choice%%[![:space:]]*}"}"
+    choice="${choice%"${choice##*[![:space:]]}"}"
+
+    case "${choice}" in
+      1)
+        ask_oid || continue
+        echo
+        registration_without_bo "${OID}" || echo "Ошибка запроса." >&2
+        ;;
+      2)
+        ask_oid || continue
+        echo
+        get_client_info "${OID}" || echo "Ошибка запроса." >&2
+        ;;
+      3)
+        ask_oid || continue
+        echo
+        generate_consent "${OID}" || echo "Ошибка запроса." >&2
+        ;;
+      0|q|exit|quit)
+        echo "Выход."
+        break
+        ;;
+      "")
+        continue
+        ;;
+      *)
+        echo "Неизвестная команда: ${choice}"
+        echo "Введите 1, 2, 3 или 0 (exit) для выхода."
+        ;;
+    esac
+  done
+}
+
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  cmd="${1:-}"
-  shift || true
-  case "$cmd" in
-    registration_without_bo) registration_without_bo "$@" ;;
-    get_client_info) get_client_info "$@" ;;
-    generate_consent) generate_consent "$@" ;;
-    ""|-h|--help|help) usage ;;
-    *)
-      echo "Unknown command: $cmd" >&2
-      usage >&2
-      exit 1
-      ;;
-  esac
+  run_menu
 fi
