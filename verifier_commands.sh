@@ -125,13 +125,16 @@ get_client_info() {
 }
 
 generate_consent() {
-  # OID для generate-consent не участвует
+  # Поле oid в теле обязательно для валидации, на результат не влияет.
+  # Берём текущий OID из меню, без отдельного диалога.
+  local oid="${OID:-0}"
+
   curl -sS --location \
     "${BASE_URL}/api/v1/generate-consent" \
     --header "trace-id: ${TRACE_ID}" \
     --header "Content-Type: application/json" \
     --header "X-API-KEY: ${VERIFIER_X_API_KEY}" \
-    --data '{}'
+    --data "{\"oid\": \"${oid}\"}"
 
   echo
 }
