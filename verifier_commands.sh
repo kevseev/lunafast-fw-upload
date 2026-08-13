@@ -65,15 +65,13 @@ get_client_info() {
 }
 
 generate_consent() {
-  local oid="${1:-$OID}"
-  OID="$oid"
-
+  # OID для generate-consent не участвует
   curl -sS --location \
     "${BASE_URL}/api/v1/generate-consent" \
     --header "trace-id: ${TRACE_ID}" \
     --header "Content-Type: application/json" \
     --header "X-API-KEY: ${VERIFIER_X_API_KEY}" \
-    --data "{\"oid\": \"${oid}\"}"
+    --data '{}'
 
   echo
 }
@@ -115,9 +113,8 @@ run_menu() {
         get_client_info "${OID}" || echo "Ошибка запроса." >&2
         ;;
       3)
-        ask_oid || continue
         echo
-        generate_consent "${OID}" || echo "Ошибка запроса." >&2
+        generate_consent || echo "Ошибка запроса." >&2
         ;;
       0|q|exit|quit)
         echo "Выход."
